@@ -18,6 +18,18 @@ from utils_io import (
 st.set_page_config(page_title="kibana_user_manager", layout="wide")
 st.title("kibana_user_manager")
 st.caption("Gestión masiva de usuarios/roles en múltiples instancias Elasticsearch/Kibana")
+st.markdown("**Powered by GoAI**")
+
+
+DEFAULT_SUPERUSERS = [
+    {"username": "jropero", "full_name": "Jorge Ropero", "email": "jropero@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "mfonseca", "full_name": "Marcio Fonseca", "email": "mfonseca@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "svega", "full_name": "Sevastian Vega", "email": "svega@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "ppimenta", "full_name": "Paulo Pimenta", "email": "ppimenta@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "dpires", "full_name": "David Pires", "email": "dpires@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "nfrade", "full_name": "Nuno Frade", "email": "nfrade@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "cpatino", "full_name": "Camilo Patino", "email": "cpatino@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+]
 
 
 if "instances" not in st.session_state:
@@ -78,6 +90,24 @@ def parse_bulk_users_from_csv(content: bytes) -> List[Dict[str, object]]:
         if username and password:
             result.append({"username": username, "password": password, "roles": roles})
     return result
+
+
+def parse_roles(raw_roles: object) -> List[str]:
+    if isinstance(raw_roles, list):
+        return [str(role).strip() for role in raw_roles if str(role).strip()]
+
+    role_text = str(raw_roles or "").strip()
+    if not role_text:
+        return []
+
+    separators = [";", ","]
+    roles = [role_text]
+    for separator in separators:
+        if separator in role_text:
+            roles = [part.strip() for part in role_text.split(separator)]
+            break
+
+    return [role for role in roles if role]
 
 
 with st.sidebar:
@@ -302,6 +332,92 @@ with tab_create:
                                 }
                             )
                     st.dataframe(pd.DataFrame(results), use_container_width=True)
+
+            st.markdown("#### Feature opcional: usuarios default (superuser)")
+            enable_default_superusers = st.checkbox("Crear usuarios default (superuser)", value=False)
+
+            if enable_default_superusers:
+                default_password = st.text_input(
+                    "Password global",
+                    type="password",
+                    value="Gocontact2021",
+                    key="default_superusers_global_password",
+                )
+
+                apply_password = st.button("Aplicar a todos", key="apply_default_superuser_password")
+
+                if "default_superusers_table" not in st.session_state:
+                    st.session_state.default_superusers_table = [dict(row) for row in DEFAULT_SUPERUSERS]
+
+                if apply_password:
+                    st.session_state.default_superusers_table = [
+                        {**row, "password": default_password} for row in st.session_state.default_superusers_table
+                    ]
+
+                default_users_df = pd.DataFrame(st.session_state.default_superusers_table)
+                edited_default_users_df = st.data_editor(
+                    default_users_df,
+                    use_container_width=True,
+                    num_rows="dynamic",
+                    key="default_superusers_editor",
+                )
+                st.session_state.default_superusers_table = edited_default_users_df.to_dict("records")
+
+                confirm_default_superusers = st.checkbox(
+                    "Confirmo que quiero crear usuarios SUPERUSER en la(s) instancia(s) seleccionada(s).",
+                    value=False,
+                )
+
+                if st.button("Crear usuarios default", type="primary"):
+                    if not confirm_default_superusers:
+                        st.error("Debes confirmar antes de crear usuarios SUPERUSER.")
+                    else:
+                        created_count = 0
+                        failures = []
+
+                        for instance_name, instance_url in target_instances:
+                            for row in st.session_state.default_superusers_table:
+                                username = str(row.get("username", "")).strip()
+                                password = str(row.get("password", "")).strip()
+                                full_name = str(row.get("full_name", "")).strip()
+                                email = str(row.get("email", "")).strip()
+                                roles = parse_roles(row.get("roles", ""))
+
+                                if not username or not password:
+                                    failures.append(
+                                        {
+                                            "instancia": instance_name,
+                                            "username": username or "(vacío)",
+                                            "error": "username/password requeridos",
+                                        }
+                                    )
+                                    continue
+
+                                resp = create_user(
+                                    instance_url,
+                                    headers,
+                                    username,
+                                    password,
+                                    roles,
+                                    full_name=full_name,
+                                    email=email,
+                                )
+
+                                if resp.get("ok"):
+                                    created_count += 1
+                                else:
+                                    failures.append(
+                                        {
+                                            "instancia": instance_name,
+                                            "username": username,
+                                            "error": resp.get("message", "error"),
+                                        }
+                                    )
+
+                        failed_count = len(failures)
+                        st.success(f"Resumen: creados={created_count}, fallidos={failed_count}")
+                        if failures:
+                            st.dataframe(pd.DataFrame(failures), use_container_width=True)
 
 with tab_roles:
     st.subheader("Roles por instancia")
