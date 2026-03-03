@@ -1,0 +1,3 @@
+name,base_url
+dev-cluster,https://es-dev.example.com:9200
+prod-cluster,https://es-prod.example.com:9200
