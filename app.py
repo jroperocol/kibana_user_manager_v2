@@ -3,7 +3,8 @@ from __future__ import annotations
 import base64
 import csv
 import io
-from typing import Dict, List
+from datetime import datetime
+from typing import Any, Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -36,6 +37,12 @@ if "instances" not in st.session_state:
     st.session_state.instances = []
 if "auth" not in st.session_state:
     st.session_state.auth = {"mode": "Basic Auth", "username": "", "password": "", "api_key": ""}
+if "instance_auth" not in st.session_state:
+    st.session_state.instance_auth = {}
+if "auth_logs" not in st.session_state:
+    st.session_state.auth_logs = []
+if "instances_signature" not in st.session_state:
+    st.session_state.instances_signature = ""
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -110,6 +117,121 @@ def parse_roles(raw_roles: object) -> List[str]:
     return [role for role in roles if role]
 
 
+def short_message(resp: Dict[str, Any]) -> str:
+    message = str(resp.get("message") or "").strip()
+    status_code = resp.get("status_code")
+    if status_code in (401, 403):
+        return "Unauthorized" if status_code == 401 else "Forbidden"
+    if message:
+        return message.splitlines()[0][:120]
+    if resp.get("ok"):
+        return "OK"
+    return "Error"
+
+
+def truncate_detail(value: object, max_len: int = 1000) -> str:
+    text = str(value or "")
+    return text[:max_len] + ("..." if len(text) > max_len else "")
+
+
+def is_auth_failure(resp: Dict[str, Any]) -> bool:
+    return resp.get("status_code") in (401, 403)
+
+
+def record_auth(
+    instance_name: str,
+    base_url: str,
+    ok: bool,
+    status_code: object,
+    msg_short: str,
+    detail: str,
+    action: str,
+) -> None:
+    ts = datetime.utcnow().isoformat(timespec="seconds")
+    st.session_state.instance_auth[base_url] = {
+        "name": instance_name,
+        "base_url": base_url,
+        "ok": bool(ok),
+        "status_code": status_code,
+        "message_short": msg_short,
+        "detail": truncate_detail(detail, 1000),
+        "last_checked": ts,
+        "action": action,
+    }
+    st.session_state.auth_logs.append(
+        {
+            "ts": ts,
+            "instance": instance_name,
+            "base_url": base_url,
+            "action": action,
+            "status_code": status_code,
+            "message": msg_short,
+            "detail": truncate_detail(detail, 1000),
+        }
+    )
+
+
+def check_all_instances_auth(instances: List[Dict[str, str]], headers: Dict[str, str], action: str = "test_connection") -> None:
+    if not headers:
+        return
+    for item in instances:
+        resp = test_connection(item["base_url"], headers)
+        status_code = resp.get("status_code")
+        msg_short = short_message(resp)
+        detail = resp.get("message") or resp.get("data") or ""
+        record_auth(item["name"], item["base_url"], bool(resp.get("ok")), status_code, msg_short, str(detail), action)
+
+
+def get_operable_instances(all_instances: Dict[str, str]) -> Dict[str, str]:
+    operable: Dict[str, str] = {}
+    for name, base_url in all_instances.items():
+        auth_state = st.session_state.instance_auth.get(base_url)
+        if auth_state is None or auth_state.get("ok", True):
+            operable[name] = base_url
+    return operable
+
+
+def build_auth_status_rows(instances: List[Dict[str, str]]) -> List[Dict[str, object]]:
+    rows = []
+    for item in instances:
+        auth_state = st.session_state.instance_auth.get(item["base_url"], {})
+        known = bool(auth_state)
+        ok = bool(auth_state.get("ok")) if known else False
+        rows.append(
+            {
+                "name": item["name"],
+                "base_url": item["base_url"],
+                "auth_status": "OK" if known and ok else ("FAIL" if known else "PENDING"),
+                "http_status": auth_state.get("status_code", ""),
+                "message_short": auth_state.get("message_short", "No verificado"),
+                "timestamp": auth_state.get("last_checked", ""),
+            }
+        )
+    return rows
+
+
+def build_auth_report_excel(instances: List[Dict[str, str]]) -> bytes:
+    auth_rows = []
+    for item in instances:
+        auth_state = st.session_state.instance_auth.get(item["base_url"], {})
+        auth_rows.append(
+            {
+                "name": item["name"],
+                "base_url": item["base_url"],
+                "auth_ok": bool(auth_state.get("ok", False)),
+                "status_code": auth_state.get("status_code", ""),
+                "message_short": auth_state.get("message_short", "No verificado"),
+            }
+        )
+
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(auth_rows).to_excel(writer, index=False, sheet_name="auth_status")
+        if st.session_state.auth_logs:
+            pd.DataFrame(st.session_state.auth_logs).to_excel(writer, index=False, sheet_name="logs")
+    return buffer.getvalue()
+
+
 with st.sidebar:
     st.header("Instancias")
 
@@ -134,6 +256,8 @@ with st.sidebar:
             cleaned_instances.append(candidate)
     st.session_state.instances = cleaned_instances
 
+    current_signature = "|".join(f"{item['name']}::{item['base_url']}" for item in st.session_state.instances)
+
     import_file = st.file_uploader("Importar CSV/JSON", type=["csv", "json"])
     if import_file is not None:
         bytes_data = import_file.read()
@@ -147,23 +271,53 @@ with st.sidebar:
             for item in loaded:
                 merged[(item["name"], item["base_url"])] = item
             st.session_state.instances = list(merged.values())
+            current_signature = "|".join(f"{item['name']}::{item['base_url']}" for item in st.session_state.instances)
             st.success(f"Instancias importadas: {len(loaded)}")
         for err in errors:
-            st.error(err)
+            st.warning(err)
+
+    headers = get_auth_headers()
+
+    if headers and current_signature != st.session_state.instances_signature and st.session_state.instances:
+        check_all_instances_auth(st.session_state.instances, headers, action="instances_changed")
+        st.session_state.instances_signature = current_signature
 
     if st.button("Probar conexión"):
-        headers = get_auth_headers()
         if not headers:
             st.warning("Configura autenticación antes de probar conexión.")
         elif not st.session_state.instances:
             st.warning("Agrega al menos una instancia.")
         else:
-            for item in st.session_state.instances:
-                resp = test_connection(item["base_url"], headers)
-                if resp.get("ok"):
-                    st.success(f"{item['name']}: OK")
-                else:
-                    st.error(f"{item['name']}: Error ({resp.get('status_code')}) - {resp.get('message')}")
+            check_all_instances_auth(st.session_state.instances, headers, action="manual_test_connection")
+            st.session_state.instances_signature = current_signature
+
+    st.divider()
+    st.subheader("Estado de autenticación")
+
+    auth_rows = build_auth_status_rows(st.session_state.instances)
+    if auth_rows:
+        status_df = pd.DataFrame(auth_rows)
+        ok_count = int((status_df["auth_status"] == "OK").sum())
+        fail_count = int((status_df["auth_status"] == "FAIL").sum())
+        pending_count = int((status_df["auth_status"] == "PENDING").sum())
+        st.caption(f"OK: {ok_count} | FAIL: {fail_count} | PENDING: {pending_count}")
+        st.dataframe(status_df, use_container_width=True)
+        st.download_button(
+            "Descargar reporte Excel",
+            data=build_auth_report_excel(st.session_state.instances),
+            file_name="auth_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.caption("Sin instancias cargadas.")
+
+    show_logs = st.checkbox("Mostrar logs", value=False)
+    if show_logs:
+        with st.expander("Logs de autenticación", expanded=True):
+            if st.session_state.auth_logs:
+                st.dataframe(pd.DataFrame(st.session_state.auth_logs[-200:]), use_container_width=True)
+            else:
+                st.caption("No hay logs disponibles.")
 
     st.divider()
     st.header("Autenticación")
@@ -183,11 +337,17 @@ tab_users, tab_create, tab_roles = st.tabs(["Usuarios", "Crear usuarios", "Roles
 with tab_users:
     st.subheader("Listado de usuarios")
     all_instances = instances_dict()
+    operable_instances = get_operable_instances(all_instances)
+    failed_count = len(all_instances) - len(operable_instances)
     if not all_instances:
         st.info("No hay instancias configuradas.")
+    elif not operable_instances:
+        st.warning(f"No hay instancias operables. Fallaron autenticación: {failed_count}.")
     else:
-        selected_name = st.selectbox("Instancia", list(all_instances.keys()), key="users_instance")
-        base_url = all_instances[selected_name]
+        if failed_count:
+            st.caption(f"Se excluyeron {failed_count} instancia(s) con auth fallida.")
+        selected_name = st.selectbox("Instancia", list(operable_instances.keys()), key="users_instance")
+        base_url = operable_instances[selected_name]
         headers = get_auth_headers()
 
         if st.button("Refrescar", key="refresh_users"):
@@ -195,6 +355,16 @@ with tab_users:
                 st.warning("Completa autenticación.")
             else:
                 users_resp = list_users(base_url, headers)
+                if is_auth_failure(users_resp):
+                    record_auth(
+                        selected_name,
+                        base_url,
+                        False,
+                        users_resp.get("status_code"),
+                        short_message(users_resp),
+                        str(users_resp.get("message", "")),
+                        "list_users",
+                    )
                 st.session_state.users_data = users_resp
 
         users_resp = st.session_state.get("users_data", {})
@@ -229,6 +399,16 @@ with tab_users:
                         results = []
                         for username in selected_to_delete:
                             resp = delete_user(base_url, headers, username)
+                            if is_auth_failure(resp):
+                                record_auth(
+                                    selected_name,
+                                    base_url,
+                                    False,
+                                    resp.get("status_code"),
+                                    short_message(resp),
+                                    str(resp.get("message", "")),
+                                    "delete_user",
+                                )
                             results.append(
                                 {
                                     "instancia": selected_name,
@@ -245,16 +425,22 @@ with tab_users:
 with tab_create:
     st.subheader("Crear usuarios")
     all_instances = instances_dict()
+    operable_instances = get_operable_instances(all_instances)
+    failed_count = len(all_instances) - len(operable_instances)
     if not all_instances:
         st.info("No hay instancias configuradas.")
+    elif not operable_instances:
+        st.warning(f"No hay instancias operables. Fallaron autenticación: {failed_count}.")
     else:
-        target = st.selectbox("Instancia destino", ["Todas"] + list(all_instances.keys()), key="create_instance")
+        if failed_count:
+            st.caption(f"Se excluyeron {failed_count} instancia(s) con auth fallida.")
+        target = st.selectbox("Instancia destino", ["Todas"] + list(operable_instances.keys()), key="create_instance")
         headers = get_auth_headers()
 
         if not headers:
             st.warning("Completa autenticación para consultar roles y crear usuarios.")
         else:
-            target_instances = list(all_instances.items()) if target == "Todas" else [(target, all_instances[target])]
+            target_instances = list(operable_instances.items()) if target == "Todas" else [(target, operable_instances[target])]
 
             all_role_names = set()
             role_errors = []
@@ -263,12 +449,20 @@ with tab_create:
                 if roles_resp.get("ok"):
                     all_role_names.update(roles_resp.get("data", {}).keys())
                 else:
-                    role_errors.append(
-                        f"{instance_name}: {roles_resp.get('status_code')} - {roles_resp.get('message')}"
-                    )
+                    role_errors.append(instance_name)
+                    if is_auth_failure(roles_resp):
+                        record_auth(
+                            instance_name,
+                            instance_url,
+                            False,
+                            roles_resp.get("status_code"),
+                            short_message(roles_resp),
+                            str(roles_resp.get("message", "")),
+                            "list_roles",
+                        )
 
-            for err in role_errors:
-                st.error(f"Error cargando roles: {err}")
+            if role_errors:
+                st.caption(f"Roles no disponibles en {len(role_errors)} instancia(s).")
 
             available_roles = sorted(all_role_names)
             st.caption("Roles disponibles")
@@ -288,6 +482,16 @@ with tab_create:
                     results = []
                     for instance_name, instance_url in target_instances:
                         resp = create_user(instance_url, headers, new_username, new_password, new_roles)
+                        if is_auth_failure(resp):
+                            record_auth(
+                                instance_name,
+                                instance_url,
+                                False,
+                                resp.get("status_code"),
+                                short_message(resp),
+                                str(resp.get("message", "")),
+                                "create_user_single",
+                            )
                         results.append(
                             {
                                 "instancia": instance_name,
@@ -322,6 +526,16 @@ with tab_create:
                                 str(entry["password"]),
                                 list(entry["roles"]),
                             )
+                            if is_auth_failure(resp):
+                                record_auth(
+                                    instance_name,
+                                    instance_url,
+                                    False,
+                                    resp.get("status_code"),
+                                    short_message(resp),
+                                    str(resp.get("message", "")),
+                                    "create_user_bulk",
+                                )
                             results.append(
                                 {
                                     "instancia": instance_name,
@@ -402,6 +616,16 @@ with tab_create:
                                     full_name=full_name,
                                     email=email,
                                 )
+                                if is_auth_failure(resp):
+                                    record_auth(
+                                        instance_name,
+                                        instance_url,
+                                        False,
+                                        resp.get("status_code"),
+                                        short_message(resp),
+                                        str(resp.get("message", "")),
+                                        "create_user_default",
+                                    )
 
                                 if resp.get("ok"):
                                     created_count += 1
@@ -422,17 +646,33 @@ with tab_create:
 with tab_roles:
     st.subheader("Roles por instancia")
     all_instances = instances_dict()
+    operable_instances = get_operable_instances(all_instances)
+    failed_count = len(all_instances) - len(operable_instances)
     if not all_instances:
         st.info("No hay instancias configuradas.")
+    elif not operable_instances:
+        st.warning(f"No hay instancias operables. Fallaron autenticación: {failed_count}.")
     else:
-        selected_name = st.selectbox("Instancia", list(all_instances.keys()), key="roles_instance")
+        if failed_count:
+            st.caption(f"Se excluyeron {failed_count} instancia(s) con auth fallida.")
+        selected_name = st.selectbox("Instancia", list(operable_instances.keys()), key="roles_instance")
         headers = get_auth_headers()
 
         if st.button("Refrescar roles"):
             if not headers:
                 st.warning("Completa autenticación.")
             else:
-                roles_resp = list_roles(all_instances[selected_name], headers)
+                roles_resp = list_roles(operable_instances[selected_name], headers)
+                if is_auth_failure(roles_resp):
+                    record_auth(
+                        selected_name,
+                        operable_instances[selected_name],
+                        False,
+                        roles_resp.get("status_code"),
+                        short_message(roles_resp),
+                        str(roles_resp.get("message", "")),
+                        "list_roles_tab",
+                    )
                 st.session_state.roles_data = roles_resp
 
         roles_resp = st.session_state.get("roles_data", {})
