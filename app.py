@@ -67,6 +67,14 @@ I18N = {
         "EN": "Download Excel report",
         "PT": "Baixar relatório Excel",
     },
+    "users_list_title": {"ES": "Listado de usuarios", "EN": "User list", "PT": "Lista de usuários"},
+    "username_label": {"ES": "Username", "EN": "Username", "PT": "Username"},
+    "password_label": {"ES": "Password", "EN": "Password", "PT": "Password"},
+    "search_user_label": {
+        "ES": "Buscar usuario (username, full_name, email)",
+        "EN": "Search user (username, full_name, email)",
+        "PT": "Buscar usuário (username, full_name, email)",
+    },
 }
 
 
@@ -500,8 +508,8 @@ with st.sidebar:
     st.session_state.auth["mode"] = mode
 
     if mode == "Basic Auth":
-        st.text_input("Username", value=st.session_state.auth_input_username, key="auth_input_username")
-        st.text_input("Password", type="password", value=st.session_state.auth_input_password, key="auth_input_password")
+        st.text_input(t("username_label"), value=st.session_state.auth_input_username, key="auth_input_username")
+        st.text_input(t("password_label"), type="password", value=st.session_state.auth_input_password, key="auth_input_password")
     else:
         st.text_input("API Key", type="password", value=st.session_state.auth_input_api_key, key="auth_input_api_key")
 
@@ -516,7 +524,7 @@ with st.sidebar:
 tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
 
 with tab_users:
-    st.subheader("Listado de usuarios")
+    st.subheader(t("users_list_title"))
     all_instances = instances_dict()
     operable_instances = get_operable_instances(all_instances)
 
@@ -599,7 +607,7 @@ with tab_users:
             reset_delete_section_state()
             st.success("OK")
 
-    global_query = st.text_input("Buscar usuario (username, full_name, email)", key="delete_query")
+    global_query = st.text_input(t("search_user_label"), key="delete_query")
 
     if st.button("Buscar en instancias autenticadas"):
         headers = get_auth_headers()
@@ -750,8 +758,8 @@ with tab_create:
 
             st.markdown("#### Crear un usuario")
             with st.form("single_create_form"):
-                new_username = st.text_input("Username")
-                new_password = st.text_input("Password", type="password")
+                new_username = st.text_input(t("username_label"))
+                new_password = st.text_input(t("password_label"), type="password")
                 new_roles = st.multiselect("Roles", options=available_roles)
                 submit_single = st.form_submit_button("Crear usuario")
 
