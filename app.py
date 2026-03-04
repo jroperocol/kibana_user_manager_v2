@@ -16,49 +16,6 @@ from utils_io import (
     validate_instance_row,
 )
 
-st.set_page_config(page_title="kibana_user_manager", layout="wide")
-header_left, header_right = st.columns([6, 1])
-with header_right:
-    st.selectbox(t("language"), options=["ES", "EN", "PT"], key="lang")
-
-st.title(t("app_title"))
-st.caption(t("app_caption"))
-st.markdown("**Powered by GoAI**")
-
-
-DEFAULT_SUPERUSERS = [
-    {"username": "jropero", "full_name": "Jorge Ropero", "email": "jropero@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
-    {"username": "mfonseca", "full_name": "Marcio Fonseca", "email": "mfonseca@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
-    {"username": "svega", "full_name": "Sevastian Vega", "email": "svega@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
-    {"username": "ppimenta", "full_name": "Paulo Pimenta", "email": "ppimenta@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
-    {"username": "dpires", "full_name": "David Pires", "email": "dpires@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
-    {"username": "nfrade", "full_name": "Nuno Frade", "email": "nfrade@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
-    {"username": "cpatino", "full_name": "Camilo Patino", "email": "cpatino@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
-]
-
-
-if "instances" not in st.session_state:
-    st.session_state.instances = []
-if "auth" not in st.session_state:
-    st.session_state.auth = {"mode": "Basic Auth", "username": "", "password": "", "api_key": ""}
-if "instance_auth" not in st.session_state:
-    st.session_state.instance_auth = {}
-if "auth_report_df" not in st.session_state:
-    st.session_state.auth_report_df = pd.DataFrame()
-if "auth_logs" not in st.session_state:
-    st.session_state.auth_logs = []
-if "global_search_results" not in st.session_state:
-    st.session_state.global_search_results = []
-if "lang" not in st.session_state:
-    st.session_state.lang = "ES"
-if "auth_input_username" not in st.session_state:
-    st.session_state.auth_input_username = st.session_state.auth.get("username", "")
-if "auth_input_password" not in st.session_state:
-    st.session_state.auth_input_password = st.session_state.auth.get("password", "")
-if "auth_input_api_key" not in st.session_state:
-    st.session_state.auth_input_api_key = st.session_state.auth.get("api_key", "")
-
-
 I18N = {
     "app_title": {"ES": "kibana_user_manager", "EN": "kibana_user_manager", "PT": "kibana_user_manager"},
     "app_caption": {
@@ -120,6 +77,49 @@ def t(key: str, **kwargs: object) -> str:
     if kwargs:
         return text.format(**kwargs)
     return text
+
+
+st.set_page_config(page_title="kibana_user_manager", layout="wide")
+header_left, header_right = st.columns([6, 1])
+with header_right:
+    st.selectbox(t("language"), options=["ES", "EN", "PT"], key="lang")
+
+st.title(t("app_title"))
+st.caption(t("app_caption"))
+st.markdown("**Powered by GoAI**")
+
+
+DEFAULT_SUPERUSERS = [
+    {"username": "jropero", "full_name": "Jorge Ropero", "email": "jropero@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "mfonseca", "full_name": "Marcio Fonseca", "email": "mfonseca@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "svega", "full_name": "Sevastian Vega", "email": "svega@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "ppimenta", "full_name": "Paulo Pimenta", "email": "ppimenta@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "dpires", "full_name": "David Pires", "email": "dpires@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "nfrade", "full_name": "Nuno Frade", "email": "nfrade@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+    {"username": "cpatino", "full_name": "Camilo Patino", "email": "cpatino@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
+]
+
+
+if "instances" not in st.session_state:
+    st.session_state.instances = []
+if "auth" not in st.session_state:
+    st.session_state.auth = {"mode": "Basic Auth", "username": "", "password": "", "api_key": ""}
+if "instance_auth" not in st.session_state:
+    st.session_state.instance_auth = {}
+if "auth_report_df" not in st.session_state:
+    st.session_state.auth_report_df = pd.DataFrame()
+if "auth_logs" not in st.session_state:
+    st.session_state.auth_logs = []
+if "global_search_results" not in st.session_state:
+    st.session_state.global_search_results = []
+if "lang" not in st.session_state:
+    st.session_state.lang = "ES"
+if "auth_input_username" not in st.session_state:
+    st.session_state.auth_input_username = st.session_state.auth.get("username", "")
+if "auth_input_password" not in st.session_state:
+    st.session_state.auth_input_password = st.session_state.auth.get("password", "")
+if "auth_input_api_key" not in st.session_state:
+    st.session_state.auth_input_api_key = st.session_state.auth.get("api_key", "")
 
 
 def get_auth_headers() -> Dict[str, str]:
