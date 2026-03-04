@@ -17,8 +17,12 @@ from utils_io import (
 )
 
 st.set_page_config(page_title="kibana_user_manager", layout="wide")
-st.title("kibana_user_manager")
-st.caption("Gestión masiva de usuarios/roles en múltiples instancias Elasticsearch/Kibana")
+header_left, header_right = st.columns([6, 1])
+with header_right:
+    st.selectbox(t("language"), options=["ES", "EN", "PT"], key="lang")
+
+st.title(t("app_title"))
+st.caption(t("app_caption"))
 st.markdown("**Powered by GoAI**")
 
 
@@ -45,6 +49,77 @@ if "auth_logs" not in st.session_state:
     st.session_state.auth_logs = []
 if "global_search_results" not in st.session_state:
     st.session_state.global_search_results = []
+if "lang" not in st.session_state:
+    st.session_state.lang = "ES"
+if "auth_input_username" not in st.session_state:
+    st.session_state.auth_input_username = st.session_state.auth.get("username", "")
+if "auth_input_password" not in st.session_state:
+    st.session_state.auth_input_password = st.session_state.auth.get("password", "")
+if "auth_input_api_key" not in st.session_state:
+    st.session_state.auth_input_api_key = st.session_state.auth.get("api_key", "")
+
+
+I18N = {
+    "app_title": {"ES": "kibana_user_manager", "EN": "kibana_user_manager", "PT": "kibana_user_manager"},
+    "app_caption": {
+        "ES": "Gestión masiva de usuarios/roles en múltiples instancias Elasticsearch/Kibana",
+        "EN": "Bulk management of users/roles across multiple Elasticsearch/Kibana instances",
+        "PT": "Gestão em massa de usuários/funções em múltiplas instâncias Elasticsearch/Kibana",
+    },
+    "tab_users": {"ES": "Usuarios", "EN": "Users", "PT": "Usuários"},
+    "tab_create": {"ES": "Crear usuarios", "EN": "Create users", "PT": "Criar usuários"},
+    "tab_roles": {"ES": "Roles", "EN": "Roles", "PT": "Perfis"},
+    "language": {"ES": "Idioma", "EN": "Language", "PT": "Idioma"},
+    "instances": {"ES": "Instancias", "EN": "Instances", "PT": "Instâncias"},
+    "import_file": {"ES": "Importar CSV/JSON", "EN": "Import CSV/JSON", "PT": "Importar CSV/JSON"},
+    "auth_verify_all": {
+        "ES": "Verificar autenticación (todas las instancias)",
+        "EN": "Verify authentication (all instances)",
+        "PT": "Verificar autenticação (todas as instâncias)",
+    },
+    "auth_verified_progress": {"ES": "{done}/{total} verificadas", "EN": "{done}/{total} verified", "PT": "{done}/{total} verificadas"},
+    "auth_summary_done": {"ES": "Verificación finalizada. OK: {ok} | FAIL: {fail}", "EN": "Verification finished. OK: {ok} | FAIL: {fail}", "PT": "Verificação concluída. OK: {ok} | FAIL: {fail}"},
+    "status": {"ES": "Estado", "EN": "Status", "PT": "Status"},
+    "download_auth_report": {
+        "ES": "Descargar reporte autenticación (Excel)",
+        "EN": "Download authentication report (Excel)",
+        "PT": "Baixar relatório de autenticação (Excel)",
+    },
+    "download_logs": {"ES": "Descargar logs (xlsx o csv)", "EN": "Download logs (xlsx or csv)", "PT": "Baixar logs (xlsx ou csv)"},
+    "show_logs": {"ES": "Mostrar logs", "EN": "Show logs", "PT": "Mostrar logs"},
+    "auth_section": {"ES": "Autenticación", "EN": "Authentication", "PT": "Autenticação"},
+    "method": {"ES": "Método", "EN": "Method", "PT": "Método"},
+    "apply_credentials": {
+        "ES": "Aplicar credenciales / Refresh credentials",
+        "EN": "Apply credentials / Refresh credentials",
+        "PT": "Aplicar credenciais / Refresh credentials",
+    },
+    "credentials_applied": {
+        "ES": "Credenciales aplicadas. Se limpió el estado dependiente de autenticación.",
+        "EN": "Credentials applied. Auth-dependent state has been reset.",
+        "PT": "Credenciais aplicadas. O estado dependente de autenticação foi limpo.",
+    },
+    "global_search_delete": {"ES": "Buscar/Borrar usuario global", "EN": "Global user search/delete", "PT": "Buscar/Excluir usuário global"},
+    "reset_delete_section": {
+        "ES": "Reset sección de borrado / New deletion",
+        "EN": "Reset deletion section / New deletion",
+        "PT": "Reset seção de exclusão / Nova exclusão",
+    },
+    "download_delete_report": {
+        "ES": "Descargar reporte Excel / Download Excel report",
+        "EN": "Download Excel report",
+        "PT": "Baixar relatório Excel",
+    },
+}
+
+
+def t(key: str, **kwargs: object) -> str:
+    lang = st.session_state.get("lang", "ES")
+    base = I18N.get(key, {})
+    text = base.get(lang) or base.get("ES") or key
+    if kwargs:
+        return text.format(**kwargs)
+    return text
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -261,8 +336,43 @@ def build_logs_csv() -> bytes:
     return pd.DataFrame(st.session_state.auth_logs).to_csv(index=False).encode("utf-8")
 
 
+def reset_auth_dependent_state() -> None:
+    st.session_state.instance_auth = {}
+    st.session_state.auth_report_df = pd.DataFrame()
+    st.session_state.auth_logs = []
+    st.session_state.users_data = {}
+    st.session_state.roles_data = {}
+
+
+def reset_delete_section_state() -> None:
+    delete_keys = [
+        "delete_query",
+        "delete_results",
+        "delete_selected_matches",
+        "delete_confirm_text",
+        "delete_confirm_check",
+        "delete_all_matches",
+        "delete_last_report_rows",
+        "delete_last_target_user",
+    ]
+    for key in delete_keys:
+        if key in st.session_state:
+            del st.session_state[key]
+
+
+def build_delete_report_excel() -> bytes:
+    rows = st.session_state.get("delete_last_report_rows", [])
+    if not rows:
+        return b""
+    df = pd.DataFrame(rows)
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="delete_report")
+    return buffer.getvalue()
+
+
 with st.sidebar:
-    st.header("Instancias")
+    st.header(t("instances"))
 
     editable_df = pd.DataFrame(st.session_state.instances or [{"name": "", "base_url": ""}])
     updated_df = st.data_editor(
@@ -285,7 +395,7 @@ with st.sidebar:
             cleaned_instances.append(candidate)
     st.session_state.instances = cleaned_instances
 
-    import_file = st.file_uploader("Importar CSV/JSON", type=["csv", "json"])
+    import_file = st.file_uploader(t("import_file"), type=["csv", "json"])
     if import_file is not None:
         bytes_data = import_file.read()
         if import_file.name.lower().endswith(".csv"):
@@ -307,7 +417,7 @@ with st.sidebar:
 
     headers = get_auth_headers()
 
-    if st.button("Verificar autenticación (todas las instancias)", type="primary"):
+    if st.button(t("auth_verify_all"), type="primary"):
         if not headers:
             st.warning("Configura autenticación antes de verificar.")
         elif not st.session_state.instances:
@@ -343,16 +453,16 @@ with st.sidebar:
                 )
                 table_placeholder.dataframe(pd.DataFrame(running_rows), use_container_width=True)
                 progress.progress(index / total)
-                progress_text.caption(f"{index}/{total} verificadas")
+                progress_text.caption(t("auth_verified_progress", done=index, total=total))
 
             refresh_auth_report_df()
             report_df = st.session_state.auth_report_df
             ok_count = int((report_df["auth_ok"] == True).sum()) if not report_df.empty else 0
             fail_count = int((report_df["auth_ok"] == False).sum()) if not report_df.empty else 0
-            st.success(f"Verificación finalizada. OK: {ok_count} | FAIL: {fail_count}")
+            st.success(t("auth_summary_done", ok=ok_count, fail=fail_count))
 
     st.divider()
-    st.subheader("Estado")
+    st.subheader(t("status"))
 
     if has_auth_report():
         report_df = st.session_state.auth_report_df
@@ -362,7 +472,7 @@ with st.sidebar:
         st.dataframe(report_df[["name", "base_url", "auth_ok", "status_code", "message_short"]], use_container_width=True)
 
         st.download_button(
-            "Descargar reporte autenticación (Excel)",
+            t("download_auth_report"),
             data=build_auth_report_excel(),
             file_name="auth_report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -372,31 +482,38 @@ with st.sidebar:
 
     if st.session_state.auth_logs:
         st.download_button(
-            "Descargar logs (xlsx o csv)",
+            t("download_logs"),
             data=build_logs_csv(),
             file_name="auth_logs.csv",
             mime="text/csv",
         )
 
-    show_logs = st.checkbox("Mostrar logs", value=False)
+    show_logs = st.checkbox(t("show_logs"), value=False)
     if show_logs:
         with st.expander("Logs", expanded=True):
             st.dataframe(pd.DataFrame(st.session_state.auth_logs[-300:]), use_container_width=True)
 
     st.divider()
-    st.header("Autenticación")
+    st.header(t("auth_section"))
 
-    mode = st.radio("Método", ["Basic Auth", "API Key"], index=0 if st.session_state.auth["mode"] == "Basic Auth" else 1)
+    mode = st.radio(t("method"), ["Basic Auth", "API Key"], index=0 if st.session_state.auth["mode"] == "Basic Auth" else 1)
     st.session_state.auth["mode"] = mode
 
     if mode == "Basic Auth":
-        st.session_state.auth["username"] = st.text_input("Username", value=st.session_state.auth.get("username", ""))
-        st.session_state.auth["password"] = st.text_input("Password", type="password", value=st.session_state.auth.get("password", ""))
+        st.text_input("Username", value=st.session_state.auth_input_username, key="auth_input_username")
+        st.text_input("Password", type="password", value=st.session_state.auth_input_password, key="auth_input_password")
     else:
-        st.session_state.auth["api_key"] = st.text_input("API Key", type="password", value=st.session_state.auth.get("api_key", ""))
+        st.text_input("API Key", type="password", value=st.session_state.auth_input_api_key, key="auth_input_api_key")
+
+    if st.button(t("apply_credentials")):
+        st.session_state.auth["username"] = st.session_state.get("auth_input_username", "")
+        st.session_state.auth["password"] = st.session_state.get("auth_input_password", "")
+        st.session_state.auth["api_key"] = st.session_state.get("auth_input_api_key", "")
+        reset_auth_dependent_state()
+        st.success(t("credentials_applied"))
 
 
-tab_users, tab_create, tab_roles = st.tabs(["Usuarios", "Crear usuarios", "Roles"])
+tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
 
 with tab_users:
     st.subheader("Listado de usuarios")
@@ -475,8 +592,14 @@ with tab_users:
             st.warning(f"No se pudo listar usuarios ({short_message(users_resp)}).")
 
     st.markdown("---")
-    st.markdown("#### Buscar/Borrar usuario global")
-    global_query = st.text_input("Buscar usuario (username, full_name, email)", key="global_search_query")
+    st.markdown(f"#### {t('global_search_delete')}")
+    cols_delete_hdr = st.columns([3, 2])
+    with cols_delete_hdr[1]:
+        if st.button(t("reset_delete_section")):
+            reset_delete_section_state()
+            st.success("OK")
+
+    global_query = st.text_input("Buscar usuario (username, full_name, email)", key="delete_query")
 
     if st.button("Buscar en instancias autenticadas"):
         headers = get_auth_headers()
@@ -513,26 +636,28 @@ with tab_users:
                             )
                 progress.progress(index / total if total else 1.0)
 
-            st.session_state.global_search_results = search_rows
+            st.session_state.delete_results = search_rows
             st.success(f"Búsqueda completada. Coincidencias: {len(search_rows)}")
 
-    global_results = st.session_state.get("global_search_results", [])
+    global_results = st.session_state.get("delete_results", [])
     if global_results:
         global_df = pd.DataFrame(global_results)
         st.dataframe(global_df[["instance_name", "base_url", "username", "full_name", "email", "roles"]], use_container_width=True)
 
-        delete_all_matches = st.checkbox("Borrar todas las coincidencias", value=False)
+        delete_all_matches = st.checkbox("Borrar todas las coincidencias", value=False, key="delete_all_matches")
         selected_matches = []
         if not delete_all_matches:
             selected_matches = st.multiselect(
                 "Seleccionar coincidencias a borrar",
                 options=global_df["match_id"].tolist(),
+                key="delete_selected_matches",
             )
 
-        delete_confirm_text = st.text_input("Confirmación fuerte: escribe DELETE", key="global_delete_confirm_text")
+        delete_confirm_text = st.text_input("Confirmación fuerte: escribe DELETE", key="delete_confirm_text")
         delete_confirm_check = st.checkbox(
             "Confirmo borrar este usuario en todas las instancias seleccionadas",
             value=False,
+            key="delete_confirm_check",
         )
 
         if st.button("Eliminar coincidencias seleccionadas", type="primary"):
@@ -550,22 +675,36 @@ with tab_users:
                     progress = st.progress(0)
                     final_results = []
                     total = len(targets)
+                    deleted_usernames = sorted({row["username"] for row in targets})
                     for index, row in enumerate(targets, start=1):
                         resp = delete_user(row["base_url"], headers, row["username"])
                         handle_auth_response(row["instance_name"], row["base_url"], "global_delete_user", resp)
                         final_results.append(
                             {
+                                "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
+                                "deleted_user": row["username"],
                                 "instancia": row["instance_name"],
+                                "base_url": row["base_url"],
                                 "usuario": row["username"],
-                                "ok": resp.get("ok"),
-                                "status": resp.get("status_code"),
-                                "mensaje": short_message(resp),
+                                "resultado": "deleted" if resp.get("ok") else ("not_found" if resp.get("status_code") == 404 else "failed"),
+                                "status_code": resp.get("status_code"),
+                                "error": short_message(resp) if not resp.get("ok") else "",
                             }
                         )
                         progress.progress(index / total)
 
                     st.success("Borrado global finalizado.")
                     st.dataframe(pd.DataFrame(final_results), use_container_width=True)
+                    st.session_state.delete_last_report_rows = final_results
+                    st.session_state.delete_last_target_user = ", ".join(deleted_usernames)
+
+    if st.session_state.get("delete_last_report_rows"):
+        st.download_button(
+            t("download_delete_report"),
+            data=build_delete_report_excel(),
+            file_name="delete_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 with tab_create:
     st.subheader("Crear usuarios")
