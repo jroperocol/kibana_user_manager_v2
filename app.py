@@ -557,7 +557,7 @@ with st.sidebar:
     else:
         st.text_input("API Key", type="password", value=st.session_state.auth_input_api_key, key="auth_input_api_key")
 
-    if st.button(t("apply_credentials")):
+    if st.button(t("apply_credentials"), key="apply_credentials_btn_sidebar"):
         st.session_state.auth["username"] = st.session_state.get("auth_input_username", "")
         st.session_state.auth["password"] = st.session_state.get("auth_input_password", "")
         st.session_state.auth["api_key"] = st.session_state.get("auth_input_api_key", "")
