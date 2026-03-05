@@ -108,6 +108,21 @@ I18N = {
         "EN": "Select at least one default user to create.",
         "PT": "Selecione pelo menos um usuário padrão para criar.",
     },
+    "default_create_running": {
+        "ES": "Creando usuarios default... {done}/{total}",
+        "EN": "Creating default users... {done}/{total}",
+        "PT": "Criando usuários padrão... {done}/{total}",
+    },
+    "default_create_summary": {
+        "ES": "Seleccionados={selected} | instancias={instances} | intentos={attempted} | creados={created} | already_exists={exists} | fallidos={failed}",
+        "EN": "Selected={selected} | instances={instances} | attempts={attempted} | created={created} | already_exists={exists} | failed={failed}",
+        "PT": "Selecionados={selected} | instâncias={instances} | tentativas={attempted} | criados={created} | already_exists={exists} | falhas={failed}",
+    },
+    "download_default_create_report": {
+        "ES": "Download Excel report",
+        "EN": "Download Excel report",
+        "PT": "Download Excel report",
+    },
 }
 
 
@@ -155,6 +170,8 @@ if "global_search_results" not in st.session_state:
     st.session_state.global_search_results = []
 if "users_multi_report_rows" not in st.session_state:
     st.session_state.users_multi_report_rows = []
+if "default_create_last_rows" not in st.session_state:
+    st.session_state.default_create_last_rows = []
 if "lang" not in st.session_state:
     st.session_state.lang = "ES"
 if "auth_input_username" not in st.session_state:
@@ -423,6 +440,15 @@ def build_users_multi_report_excel(rows: List[Dict[str, object]]) -> bytes:
     return buffer.getvalue()
 
 
+def build_default_create_report_excel(rows: List[Dict[str, object]]) -> bytes:
+    if not rows:
+        return b""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="create_default_users")
+    return buffer.getvalue()
+
+
 with st.sidebar:
     st.header(t("instances"))
 
@@ -564,12 +590,6 @@ with st.sidebar:
         reset_auth_dependent_state()
         st.success(t("credentials_applied"))
 
-    if st.button(t("apply_credentials")):
-        st.session_state.auth["username"] = st.session_state.get("auth_input_username", "")
-        st.session_state.auth["password"] = st.session_state.get("auth_input_password", "")
-        st.session_state.auth["api_key"] = st.session_state.get("auth_input_api_key", "")
-        reset_auth_dependent_state()
-        st.success(t("credentials_applied"))
 
 tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
 
@@ -984,8 +1004,13 @@ with tab_create:
                     else:
                         created_count = 0
                         already_exists_count = 0
-                        failures = []
                         results = []
+                        target_instances_count = len(target_instances)
+                        selected_count = len(selected_default_rows)
+                        attempted_count = selected_count * target_instances_count
+                        progress = st.progress(0)
+                        status_line = st.empty()
+                        done_count = 0
 
                         for instance_name, instance_url in target_instances:
                             instance_users_resp = list_users(instance_url, headers)
@@ -998,18 +1023,16 @@ with tab_create:
                                 full_name = str(row.get("full_name", "")).strip()
                                 email = str(row.get("email", "")).strip()
                                 roles = parse_roles(row.get("roles", ""))
+                                done_count += 1
+                                progress.progress(done_count / attempted_count if attempted_count else 1.0)
+                                status_line.caption(t("default_create_running", done=done_count, total=attempted_count))
 
                                 if not username or not password:
-                                    failures.append(
-                                        {
-                                            "instancia": instance_name,
-                                            "username": username or "(vacío)",
-                                            "error": "username/password requeridos",
-                                        }
-                                    )
                                     results.append(
                                         {
+                                            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
                                             "instancia": instance_name,
+                                            "base_url": instance_url,
                                             "username": username or "(vacío)",
                                             "resultado": "failed",
                                             "status_code": "",
@@ -1022,7 +1045,9 @@ with tab_create:
                                     already_exists_count += 1
                                     results.append(
                                         {
+                                            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
                                             "instancia": instance_name,
+                                            "base_url": instance_url,
                                             "username": username,
                                             "resultado": "already_exists",
                                             "status_code": "",
@@ -1046,38 +1071,49 @@ with tab_create:
                                     created_count += 1
                                     results.append(
                                         {
+                                            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
                                             "instancia": instance_name,
+                                            "base_url": instance_url,
                                             "username": username,
                                             "resultado": "created",
                                             "status_code": resp.get("status_code"),
-                                            "mensaje": "created",
+                                            "mensaje": short_message(resp),
                                         }
                                     )
                                 else:
-                                    failures.append(
-                                        {
-                                            "instancia": instance_name,
-                                            "username": username,
-                                            "error": short_message(resp),
-                                        }
-                                    )
+                                    message_lc = str(resp.get("message") or "").lower()
+                                    is_already_exists = resp.get("status_code") == 409 or "already exists" in message_lc or "resource_already_exists_exception" in message_lc
+                                    if is_already_exists:
+                                        already_exists_count += 1
+                                        result_category = "already_exists"
+                                    else:
+                                        result_category = "failed"
                                     results.append(
                                         {
+                                            "timestamp": datetime.utcnow().isoformat(timespec="seconds"),
                                             "instancia": instance_name,
+                                            "base_url": instance_url,
                                             "username": username,
-                                            "resultado": "failed",
+                                            "resultado": result_category,
                                             "status_code": resp.get("status_code"),
                                             "mensaje": short_message(resp),
                                         }
                                     )
 
-                        failed_count = len(failures)
-                        st.success(
-                            f"{t('default_superusers_selected_summary', selected=len(selected_default_rows), total=len(st.session_state.default_superusers_table))} | "
-                            f"creados={created_count}, already_exists={already_exists_count}, fallidos={failed_count}"
-                        )
+                        failed_count = len([row for row in results if row.get("resultado") == "failed"])
+                        st.success(t("default_create_summary", selected=selected_count, instances=target_instances_count, attempted=attempted_count, created=created_count, exists=already_exists_count, failed=failed_count))
                         if results:
-                            st.dataframe(pd.DataFrame(results), use_container_width=True)
+                            st.dataframe(pd.DataFrame(results), use_container_width=True, height=400)
+                            st.session_state.default_create_last_rows = results
+
+                if st.session_state.get("default_create_last_rows"):
+                    st.download_button(
+                        t("download_default_create_report"),
+                        data=build_default_create_report_excel(st.session_state.default_create_last_rows),
+                        file_name="create_default_users_report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        key="download_default_create_report_btn",
+                    )
 
 with tab_roles:
     st.subheader("Roles por instancia")
