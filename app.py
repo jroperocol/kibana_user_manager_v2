@@ -75,6 +75,39 @@ I18N = {
         "EN": "Search user (username, full_name, email)",
         "PT": "Buscar usuário (username, full_name, email)",
     },
+    "users_multi_report_title": {
+        "ES": "Reporte multi-instancia de usuarios",
+        "EN": "Multi-instance users report",
+        "PT": "Relatório multi-instância de usuários",
+    },
+    "all_authenticated_instances": {
+        "ES": "Todas las instancias autenticadas",
+        "EN": "All authenticated instances",
+        "PT": "Todas as instâncias autenticadas",
+    },
+    "run_report": {"ES": "Run report", "EN": "Run report", "PT": "Run report"},
+    "clear_report": {"ES": "Clear report", "EN": "Clear report", "PT": "Clear report"},
+    "download_users_report_excel": {
+        "ES": "Descargar reporte usuarios (Excel)",
+        "EN": "Download users report (Excel)",
+        "PT": "Baixar relatório de usuários (Excel)",
+    },
+    "users_report_suggestion": {
+        "ES": "Selecciona instancias y ejecuta Run report.",
+        "EN": "Select instances and run report.",
+        "PT": "Selecione instâncias e execute Run report.",
+    },
+    "default_superusers_select_col": {"ES": "selected", "EN": "selected", "PT": "selected"},
+    "default_superusers_selected_summary": {
+        "ES": "Seleccionados {selected} de {total} usuarios default",
+        "EN": "Selected {selected} of {total} default users",
+        "PT": "Selecionados {selected} de {total} usuários padrão",
+    },
+    "default_superusers_no_selection": {
+        "ES": "Selecciona al menos un usuario default para crear.",
+        "EN": "Select at least one default user to create.",
+        "PT": "Selecione pelo menos um usuário padrão para criar.",
+    },
 }
 
 
@@ -120,6 +153,8 @@ if "auth_logs" not in st.session_state:
     st.session_state.auth_logs = []
 if "global_search_results" not in st.session_state:
     st.session_state.global_search_results = []
+if "users_multi_report_rows" not in st.session_state:
+    st.session_state.users_multi_report_rows = []
 if "lang" not in st.session_state:
     st.session_state.lang = "ES"
 if "auth_input_username" not in st.session_state:
@@ -379,6 +414,15 @@ def build_delete_report_excel() -> bytes:
     return buffer.getvalue()
 
 
+def build_users_multi_report_excel(rows: List[Dict[str, object]]) -> bytes:
+    if not rows:
+        return b""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        pd.DataFrame(rows).to_excel(writer, index=False, sheet_name="users")
+    return buffer.getvalue()
+
+
 with st.sidebar:
     st.header(t("instances"))
 
@@ -520,6 +564,12 @@ with st.sidebar:
         reset_auth_dependent_state()
         st.success(t("credentials_applied"))
 
+    if st.button(t("apply_credentials")):
+        st.session_state.auth["username"] = st.session_state.get("auth_input_username", "")
+        st.session_state.auth["password"] = st.session_state.get("auth_input_password", "")
+        st.session_state.auth["api_key"] = st.session_state.get("auth_input_api_key", "")
+        reset_auth_dependent_state()
+        st.success(t("credentials_applied"))
 
 tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
 
@@ -598,6 +648,69 @@ with tab_users:
                     st.dataframe(pd.DataFrame(results), use_container_width=True)
         elif users_resp:
             st.warning(f"No se pudo listar usuarios ({short_message(users_resp)}).")
+
+    st.markdown("---")
+    st.markdown(f"#### {t('users_multi_report_title')}")
+    report_all_instances = st.checkbox(t("all_authenticated_instances"), value=False, key="users_report_all_instances")
+    report_instance_options = list(operable_instances.keys())
+    report_selected_instances = st.multiselect(
+        "Instancias",
+        options=report_instance_options,
+        default=report_instance_options if report_all_instances else [],
+        key="users_report_instances",
+        disabled=report_all_instances,
+    )
+
+    report_targets = report_instance_options if report_all_instances else report_selected_instances
+
+    cols_report_actions = st.columns(2)
+    with cols_report_actions[0]:
+        if st.button(t("run_report"), key="run_users_multi_report"):
+            headers = get_auth_headers()
+            if not headers:
+                st.warning("Completa autenticación.")
+            elif not report_targets:
+                st.warning(t("users_report_suggestion"))
+            else:
+                report_rows = []
+                total_targets = len(report_targets)
+                progress = st.progress(0)
+                for index, instance_name in enumerate(report_targets, start=1):
+                    instance_url = operable_instances.get(instance_name)
+                    if not instance_url:
+                        continue
+                    users_resp = list_users(instance_url, headers)
+                    handle_auth_response(instance_name, instance_url, "users_multi_report", users_resp)
+                    if users_resp.get("ok"):
+                        users_map = users_resp.get("data", {})
+                        for username, payload in users_map.items():
+                            report_rows.append(
+                                {
+                                    "instance_name": instance_name,
+                                    "base_url": instance_url,
+                                    "username": username,
+                                    "full_name": payload.get("full_name", ""),
+                                    "email": payload.get("email", ""),
+                                    "enabled": payload.get("enabled", True),
+                                    "roles": ", ".join(payload.get("roles", [])),
+                                }
+                            )
+                    progress.progress(index / total_targets)
+                st.session_state.users_multi_report_rows = report_rows
+
+    with cols_report_actions[1]:
+        if st.button(t("clear_report"), key="clear_users_multi_report"):
+            st.session_state.users_multi_report_rows = []
+
+    if st.session_state.get("users_multi_report_rows"):
+        users_multi_df = pd.DataFrame(st.session_state.users_multi_report_rows)
+        st.dataframe(users_multi_df, use_container_width=True)
+        st.download_button(
+            t("download_users_report_excel"),
+            data=build_users_multi_report_excel(st.session_state.users_multi_report_rows),
+            file_name="users_report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     st.markdown("---")
     st.markdown(f"#### {t('global_search_delete')}")
@@ -831,7 +944,7 @@ with tab_create:
                 apply_password = st.button("Aplicar a todos", key="apply_default_superuser_password")
 
                 if "default_superusers_table" not in st.session_state:
-                    st.session_state.default_superusers_table = [dict(row) for row in DEFAULT_SUPERUSERS]
+                    st.session_state.default_superusers_table = [{**dict(row), "selected": False} for row in DEFAULT_SUPERUSERS]
 
                 if apply_password:
                     st.session_state.default_superusers_table = [
@@ -847,6 +960,17 @@ with tab_create:
                 )
                 st.session_state.default_superusers_table = edited_default_users_df.to_dict("records")
 
+                selected_default_rows = [
+                    row for row in st.session_state.default_superusers_table if bool(row.get("selected", False))
+                ]
+                st.caption(
+                    t(
+                        "default_superusers_selected_summary",
+                        selected=len(selected_default_rows),
+                        total=len(st.session_state.default_superusers_table),
+                    )
+                )
+
                 confirm_default_superusers = st.checkbox(
                     "Confirmo que quiero crear usuarios SUPERUSER en la(s) instancia(s) seleccionada(s).",
                     value=False,
@@ -855,12 +979,20 @@ with tab_create:
                 if st.button("Crear usuarios default", type="primary"):
                     if not confirm_default_superusers:
                         st.error("Debes confirmar antes de crear usuarios SUPERUSER.")
+                    elif not selected_default_rows:
+                        st.warning(t("default_superusers_no_selection"))
                     else:
                         created_count = 0
+                        already_exists_count = 0
                         failures = []
+                        results = []
 
                         for instance_name, instance_url in target_instances:
-                            for row in st.session_state.default_superusers_table:
+                            instance_users_resp = list_users(instance_url, headers)
+                            handle_auth_response(instance_name, instance_url, "list_users_before_create_default", instance_users_resp)
+                            instance_users_map = instance_users_resp.get("data", {}) if instance_users_resp.get("ok") else {}
+
+                            for row in selected_default_rows:
                                 username = str(row.get("username", "")).strip()
                                 password = str(row.get("password", "")).strip()
                                 full_name = str(row.get("full_name", "")).strip()
@@ -873,6 +1005,28 @@ with tab_create:
                                             "instancia": instance_name,
                                             "username": username or "(vacío)",
                                             "error": "username/password requeridos",
+                                        }
+                                    )
+                                    results.append(
+                                        {
+                                            "instancia": instance_name,
+                                            "username": username or "(vacío)",
+                                            "resultado": "failed",
+                                            "status_code": "",
+                                            "mensaje": "username/password requeridos",
+                                        }
+                                    )
+                                    continue
+
+                                if username in instance_users_map:
+                                    already_exists_count += 1
+                                    results.append(
+                                        {
+                                            "instancia": instance_name,
+                                            "username": username,
+                                            "resultado": "already_exists",
+                                            "status_code": "",
+                                            "mensaje": "already_exists",
                                         }
                                     )
                                     continue
@@ -890,6 +1044,15 @@ with tab_create:
 
                                 if resp.get("ok"):
                                     created_count += 1
+                                    results.append(
+                                        {
+                                            "instancia": instance_name,
+                                            "username": username,
+                                            "resultado": "created",
+                                            "status_code": resp.get("status_code"),
+                                            "mensaje": "created",
+                                        }
+                                    )
                                 else:
                                     failures.append(
                                         {
@@ -898,11 +1061,23 @@ with tab_create:
                                             "error": short_message(resp),
                                         }
                                     )
+                                    results.append(
+                                        {
+                                            "instancia": instance_name,
+                                            "username": username,
+                                            "resultado": "failed",
+                                            "status_code": resp.get("status_code"),
+                                            "mensaje": short_message(resp),
+                                        }
+                                    )
 
                         failed_count = len(failures)
-                        st.success(f"Resumen: creados={created_count}, fallidos={failed_count}")
-                        if failures:
-                            st.dataframe(pd.DataFrame(failures), use_container_width=True)
+                        st.success(
+                            f"{t('default_superusers_selected_summary', selected=len(selected_default_rows), total=len(st.session_state.default_superusers_table))} | "
+                            f"creados={created_count}, already_exists={already_exists_count}, fallidos={failed_count}"
+                        )
+                        if results:
+                            st.dataframe(pd.DataFrame(results), use_container_width=True)
 
 with tab_roles:
     st.subheader("Roles por instancia")
