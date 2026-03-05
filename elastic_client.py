@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -67,9 +67,15 @@ def create_user(
     username: str,
     password: str,
     roles: List[str],
+    full_name: Optional[str] = None,
+    email: Optional[str] = None,
 ) -> Dict[str, Any]:
     """PUT /_security/user/{username}"""
     payload = {"password": password, "roles": roles}
+    if full_name:
+        payload["full_name"] = full_name
+    if email:
+        payload["email"] = email
     return _request("PUT", f"{base_url}/_security/user/{username}", auth_headers, json_body=payload)
 
 
