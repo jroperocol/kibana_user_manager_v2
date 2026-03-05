@@ -14,6 +14,7 @@ Aplicación Streamlit para gestionar usuarios y roles en múltiples instancias d
   - Crear usuarios individuales
   - Crear usuarios en bulk (textarea o CSV)
   - Eliminar usuarios seleccionados con confirmación extra (`DELETE`)
+- Feature opcional: creación de usuarios default con rol `superuser`.
 - Listado de roles por instancia (solo lectura).
 - Manejo básico de errores por instancia (401/403/timeout/SSL/otros).
 
@@ -65,6 +66,21 @@ username,password,role1;role2
 ```
 
 - CSV de bulk: columnas `username,password,roles` donde `roles` usa `;` como separador.
+
+## Feature opcional: usuarios default (superuser)
+
+- Está deshabilitada por defecto.
+- Se activa en la pestaña **Crear usuarios** con el checkbox **"Crear usuarios default (superuser)"**.
+- Incluye password global editable, con valor inicial `Gocontact2021`, y opción **"Aplicar a todos"**.
+- Muestra una tabla editable con columnas: `username`, `full_name`, `email`, `roles`, `password`.
+- Requiere confirmación explícita antes de ejecutar:
+  - **"Confirmo que quiero crear usuarios SUPERUSER en la(s) instancia(s) seleccionada(s)."**
+- La ejecución es independiente por usuario/instancia:
+  - continúa aunque haya errores puntuales,
+  - muestra resumen de `creados` / `fallidos`,
+  - y lista de errores por usuario.
+
+> ⚠️ **Advertencia:** el rol `superuser` otorga privilegios administrativos completos. Úsalo solo cuando sea estrictamente necesario.
 
 ## Notas de seguridad
 
