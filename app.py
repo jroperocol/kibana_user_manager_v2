@@ -564,6 +564,12 @@ with st.sidebar:
         reset_auth_dependent_state()
         st.success(t("credentials_applied"))
 
+    if st.button(t("apply_credentials")):
+        st.session_state.auth["username"] = st.session_state.get("auth_input_username", "")
+        st.session_state.auth["password"] = st.session_state.get("auth_input_password", "")
+        st.session_state.auth["api_key"] = st.session_state.get("auth_input_api_key", "")
+        reset_auth_dependent_state()
+        st.success(t("credentials_applied"))
 
 tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
 
