@@ -20,10 +20,15 @@ SYSTEM_INDEX_PREFIXES = (
     ".slm-history",
     ".inference",
 )
+INDEX_PATTERN_SUFFIX = "*_ivrs-*"
 
 
 def to_es_datetime(value: datetime) -> str:
     return value.replace(microsecond=0).isoformat() + "Z"
+
+
+def build_search_url(base_url: str, index_pattern: str) -> str:
+    return f"{base_url.rstrip('/')}/{index_pattern}/_search"
 
 
 def build_date_range(
@@ -60,6 +65,90 @@ def build_date_range(
         return period, start, end
 
     raise ValueError(f"Unsupported period: {period}")
+
+
+def build_period_range(period: str, custom_start: Optional[date] = None, custom_end: Optional[date] = None) -> Tuple[str, str]:
+    mapping = {
+        "Today": ("now/d", "now"),
+        "Last 24 hours": ("now-1d", "now"),
+        "Last 7 days": ("now-7d", "now"),
+        "Last 30 days": ("now-30d", "now"),
+        "Last 60 days": ("now-60d", "now"),
+        "Last 90 days": ("now-90d", "now"),
+    }
+    if period in mapping:
+        return mapping[period]
+    if period == "Custom date range":
+        if custom_start is None or custom_end is None:
+            raise ValueError("Custom date range requires start and end dates")
+        next_day = custom_end + timedelta(days=1)
+        return f"{custom_start.isoformat()}T00:00:00", f"{next_day.isoformat()}T00:00:00"
+    raise ValueError(f"Unsupported period: {period}")
+
+
+def build_count_query(period_gte: str, period_lt: str, timestamp_field: str = "timestamp") -> Dict[str, Any]:
+    return {
+        "size": 0,
+        "track_total_hits": True,
+        "query": {
+            "range": {
+                timestamp_field: {
+                    "gte": period_gte,
+                    "lt": period_lt,
+                }
+            }
+        },
+    }
+
+
+def build_uuid_query(period_gte: str, period_lt: str, timestamp_field: str = "timestamp") -> Dict[str, Any]:
+    return {
+        "from": 0,
+        "size": 10000,
+        "track_total_hits": True,
+        "_source": {
+            "includes": [
+                "call.uuid",
+                timestamp_field,
+            ]
+        },
+        "query": {
+            "range": {
+                timestamp_field: {
+                    "gte": period_gte,
+                    "lt": period_lt,
+                }
+            }
+        },
+    }
+
+
+def derive_search_pattern_from_index(index_name: str) -> str:
+    if "_ivrs-" in index_name:
+        return index_name.split("_ivrs-")[0] + "*"
+    return INDEX_PATTERN_SUFFIX
+
+
+def extract_total_hits(response: Dict[str, Any]) -> int:
+    total = response.get("data", {}).get("hits", {}).get("total", 0)
+    if isinstance(total, dict):
+        return int(total.get("value", 0))
+    return int(total or 0)
+
+
+def extract_uuid_rows(response: Dict[str, Any], timestamp_field: str = "timestamp") -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    hits = response.get("data", {}).get("hits", {}).get("hits", [])
+    for hit in hits:
+        source = hit.get("_source", {})
+        call_data = source.get("call", {}) if isinstance(source.get("call", {}), dict) else {}
+        rows.append(
+            {
+                "call_uuid": str(call_data.get("uuid", "")),
+                "timestamp": str(source.get(timestamp_field, "")),
+            }
+        )
+    return rows
 
 
 def list_indices(
