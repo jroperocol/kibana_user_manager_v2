@@ -9,7 +9,15 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from elastic_client import create_user, delete_user, list_roles, list_users, test_connection
+from elastic_client import create_user, delete_user, list_indices as es_list_indices, list_roles, list_users, search_index, test_connection
+from index_activity import (
+    build_date_range,
+    build_index_activity_report,
+    count_index_activity,
+    filter_indices,
+    fetch_index_uuids,
+    list_indices as index_list_indices,
+)
 from utils_io import (
     load_instances_from_csv,
     load_instances_from_json,
@@ -155,6 +163,11 @@ DEFAULT_SUPERUSERS = [
     {"username": "cpatino", "full_name": "Camilo Patino", "email": "cpatino@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
 ]
 
+if "default_users_df" not in st.session_state:
+    st.session_state.default_users_df = pd.DataFrame([{**dict(row), "selected": False} for row in DEFAULT_SUPERUSERS])
+if "default_users_selection" not in st.session_state:
+    st.session_state.default_users_selection = []
+
 
 if "instances" not in st.session_state:
     st.session_state.instances = []
@@ -180,6 +193,22 @@ if "auth_input_password" not in st.session_state:
     st.session_state.auth_input_password = st.session_state.auth.get("password", "")
 if "auth_input_api_key" not in st.session_state:
     st.session_state.auth_input_api_key = st.session_state.auth.get("api_key", "")
+if "index_report_rows" not in st.session_state:
+    st.session_state.index_report_rows = []
+if "index_report_errors" not in st.session_state:
+    st.session_state.index_report_errors = []
+if "authenticated_instances" not in st.session_state:
+    st.session_state.authenticated_instances = []
+if "selected_instances" not in st.session_state:
+    st.session_state.selected_instances = []
+if "loaded_indices_df" not in st.session_state:
+    st.session_state.loaded_indices_df = pd.DataFrame()
+if "index_report_df" not in st.session_state:
+    st.session_state.index_report_df = pd.DataFrame()
+if "index_pattern" not in st.session_state:
+    st.session_state.index_pattern = "*_ivrs-*"
+if "include_system_indices" not in st.session_state:
+    st.session_state.include_system_indices = False
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -402,6 +431,8 @@ def reset_auth_dependent_state() -> None:
     st.session_state.auth_logs = []
     st.session_state.users_data = {}
     st.session_state.roles_data = {}
+    st.session_state.create_roles_cache = {}
+    st.session_state.create_roles_cache_key = None
 
 
 def reset_delete_section_state() -> None:
@@ -591,7 +622,7 @@ with st.sidebar:
         st.success(t("credentials_applied"))
 
 
-tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
+tab_users, tab_create, tab_roles, tab_index = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles"), "Index"])
 
 with tab_users:
     st.subheader(t("users_list_title"))
@@ -871,16 +902,28 @@ with tab_create:
             st.warning("Completa autenticación para consultar roles y crear usuarios.")
         else:
             target_instances = list(operable_instances.items()) if target == "Todas" else [(target, operable_instances[target])]
-
-            all_role_names = set()
-            role_errors = 0
-            for instance_name, instance_url in target_instances:
-                roles_resp = list_roles(instance_url, headers)
-                handle_auth_response(instance_name, instance_url, "list_roles", roles_resp)
-                if roles_resp.get("ok"):
-                    all_role_names.update(roles_resp.get("data", {}).keys())
-                else:
-                    role_errors += 1
+            roles_cache_key = {
+                "instances": tuple(target_instances),
+                "mode": st.session_state.auth.get("mode", ""),
+                "username": st.session_state.auth.get("username", ""),
+                "api_key": st.session_state.auth.get("api_key", ""),
+            }
+            if st.session_state.get("create_roles_cache_key") != roles_cache_key:
+                all_role_names = set()
+                role_errors = 0
+                for instance_name, instance_url in target_instances:
+                    roles_resp = list_roles(instance_url, headers)
+                    handle_auth_response(instance_name, instance_url, "list_roles", roles_resp)
+                    if roles_resp.get("ok"):
+                        all_role_names.update(roles_resp.get("data", {}).keys())
+                    else:
+                        role_errors += 1
+                st.session_state.create_roles_cache_key = roles_cache_key
+                st.session_state.create_roles_cache = {"all_role_names": all_role_names, "role_errors": role_errors}
+            else:
+                cache_data = st.session_state.get("create_roles_cache", {"all_role_names": set(), "role_errors": 0})
+                all_role_names = set(cache_data.get("all_role_names", set()))
+                role_errors = int(cache_data.get("role_errors", 0))
 
             if role_errors:
                 st.caption(f"Roles no disponibles en {role_errors} instancia(s).")
@@ -963,31 +1006,35 @@ with tab_create:
 
                 apply_password = st.button("Aplicar a todos", key="apply_default_superuser_password")
 
-                if "default_superusers_table" not in st.session_state:
-                    st.session_state.default_superusers_table = [{**dict(row), "selected": False} for row in DEFAULT_SUPERUSERS]
-
                 if apply_password:
-                    st.session_state.default_superusers_table = [
-                        {**row, "password": default_password} for row in st.session_state.default_superusers_table
-                    ]
+                    df_pwd = st.session_state.default_users_df.copy()
+                    if "password" in df_pwd.columns:
+                        df_pwd["password"] = default_password
+                    st.session_state.default_users_df = df_pwd
 
-                default_users_df = pd.DataFrame(st.session_state.default_superusers_table)
                 edited_default_users_df = st.data_editor(
-                    default_users_df,
+                    st.session_state.default_users_df,
                     use_container_width=True,
                     num_rows="dynamic",
                     key="default_superusers_editor",
                 )
-                st.session_state.default_superusers_table = edited_default_users_df.to_dict("records")
+                st.session_state.default_users_df = edited_default_users_df.copy()
+                st.session_state.default_users_selection = (
+                    edited_default_users_df.loc[edited_default_users_df["selected"] == True, "username"].astype(str).tolist()
+                    if "selected" in edited_default_users_df.columns and "username" in edited_default_users_df.columns
+                    else []
+                )
 
                 selected_default_rows = [
-                    row for row in st.session_state.default_superusers_table if bool(row.get("selected", False))
+                    row
+                    for row in st.session_state.default_users_df.to_dict("records")
+                    if str(row.get("username", "")) in st.session_state.default_users_selection
                 ]
                 st.caption(
                     t(
                         "default_superusers_selected_summary",
                         selected=len(selected_default_rows),
-                        total=len(st.session_state.default_superusers_table),
+                        total=len(st.session_state.default_users_df),
                     )
                 )
 
@@ -1159,3 +1206,191 @@ with tab_roles:
             st.dataframe(pd.DataFrame(role_rows), use_container_width=True)
         elif roles_resp:
             st.warning(f"No se pudieron listar roles ({short_message(roles_resp)}).")
+
+with tab_index:
+    st.subheader("Index")
+    all_instances = instances_dict()
+    operable_instances = get_operable_instances(all_instances)
+    headers = get_auth_headers()
+    st.session_state.authenticated_instances = list(operable_instances.keys())
+
+    if has_auth_report():
+        not_auth_count = len(all_instances) - len(operable_instances)
+        if not_auth_count > 0:
+            st.caption(f"{not_auth_count} instancias no autenticadas. Ver reporte para detalles.")
+    else:
+        st.caption("Sugerencia: ejecuta verificación de autenticación para filtrar instancias no autenticadas.")
+
+    if not all_instances:
+        st.info("No hay instancias configuradas.")
+    elif not operable_instances:
+        st.warning("No hay instancias autenticadas para operar.")
+    else:
+        select_all_instances = st.checkbox("Todas las instancias autenticadas", value=False, key="index_all_instances")
+        instance_options = list(operable_instances.keys())
+        selected_instances: List[str] = []
+        if select_all_instances:
+            target_instance_names = instance_options
+        else:
+            selected_instance = st.selectbox(
+                "Instancia autenticada",
+                options=instance_options,
+                key="index_single_instance",
+            )
+            target_instance_names = [selected_instance] if selected_instance else []
+            selected_instances = target_instance_names
+        st.session_state.selected_instances = target_instance_names
+        target_instances = [{"name": name, "base_url": operable_instances[name]} for name in target_instance_names]
+
+        period_options = ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 60 days", "Last 90 days", "Custom date range"]
+        selected_period = st.selectbox("Period", options=period_options, index=1, key="index_period")
+        custom_start = None
+        custom_end = None
+        if selected_period == "Custom date range":
+            c1, c2 = st.columns(2)
+            with c1:
+                custom_start = st.date_input("Start date", key="index_custom_start")
+            with c2:
+                custom_end = st.date_input("End date", key="index_custom_end")
+
+        st.text_input("Index pattern", key="index_pattern")
+        st.checkbox("Include system indices", key="include_system_indices", value=st.session_state.include_system_indices)
+        timestamp_field = st.text_input("Timestamp field", value="timestamp", key="index_timestamp_field")
+        include_uuids = st.checkbox("Include UUIDs (slow)", value=False, key="index_include_uuids")
+        st.caption("Including UUIDs can take longer if there are many records.")
+        uuid_field = st.text_input("UUID field", value="uuid", key="index_uuid_field", disabled=not include_uuids)
+
+        if st.button("Load indices", key="load_index_list"):
+            if not headers:
+                st.warning("Completa autenticación.")
+            elif not target_instances:
+                st.warning("Selecciona al menos una instancia.")
+            else:
+                indices_rows: List[Dict[str, object]] = []
+                list_errors: List[Dict[str, object]] = []
+                for instance in target_instances:
+                    index_resp = index_list_indices(instance, headers, es_list_indices, st.session_state.index_pattern)
+                    if index_resp.get("ok"):
+                        payload = index_resp.get("data", [])
+                        parsed_rows = payload if isinstance(payload, list) else []
+                        parsed_rows = filter_indices(parsed_rows, st.session_state.include_system_indices)
+                        for item in parsed_rows:
+                            indices_rows.append(
+                                {
+                                    "instance_name": instance["name"],
+                                    "base_url": instance["base_url"],
+                                    "index_name": item.get("index", ""),
+                                    "health": item.get("health", ""),
+                                    "status": item.get("status", ""),
+                                    "docs_count": item.get("docs.count", ""),
+                                    "store_size": item.get("store.size", ""),
+                                }
+                            )
+                    else:
+                        list_errors.append(
+                            {
+                                "instance_name": instance["name"],
+                                "base_url": instance["base_url"],
+                                "index_name": "",
+                                "error": short_message(index_resp),
+                            }
+                        )
+                st.session_state.loaded_indices_df = pd.DataFrame(indices_rows)
+                st.session_state.index_report_errors = list_errors
+                st.session_state.index_report_df = pd.DataFrame()
+                st.session_state.index_report_rows = []
+
+        loaded_indices_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
+        if not loaded_indices_df.empty:
+            total_instances = int(loaded_indices_df["instance_name"].nunique()) if "instance_name" in loaded_indices_df.columns else 0
+            total_indices = len(loaded_indices_df)
+            st.caption(
+                f"Resumen: instancias={total_instances} | indices={total_indices} | patrón={st.session_state.index_pattern}"
+            )
+            preview_df = loaded_indices_df.head(500)
+            st.dataframe(preview_df, use_container_width=True)
+            if total_indices > 500:
+                st.caption("Showing first 500 rows")
+
+        if st.button("Run index activity report", type="primary", key="run_index_activity_report"):
+            if not headers:
+                st.warning("Completa autenticación.")
+            elif not target_instances:
+                st.warning("Selecciona al menos una instancia.")
+            elif st.session_state.get("loaded_indices_df", pd.DataFrame()).empty:
+                st.warning("Primero carga índices con 'Load indices'.")
+            else:
+                try:
+                    period_label, start_dt, end_dt = build_date_range(selected_period, custom_start, custom_end)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    st.stop()
+
+                runtime_indices_by_instance: Dict[str, List[Dict[str, Any]]] = {}
+                report_errors: List[Dict[str, object]] = list(st.session_state.get("index_report_errors", []))
+                loaded_df = st.session_state.loaded_indices_df
+                for instance in target_instances:
+                    instance_rows_df = loaded_df[loaded_df["base_url"] == instance["base_url"]]
+                    runtime_indices_by_instance[instance["base_url"]] = [
+                        {"index": row["index_name"]} for _, row in instance_rows_df.iterrows()
+                    ]
+
+                total_indices = sum(len(items) for items in runtime_indices_by_instance.values())
+                progress = st.progress(0.0)
+                done_state = {"done": 0}
+
+                def _count_fn(instance: Dict[str, str], index_name: str) -> Dict[str, Any]:
+                    resp = count_index_activity(
+                        instance,
+                        index_name,
+                        start_dt,
+                        end_dt,
+                        timestamp_field,
+                        headers,
+                        search_index,
+                    )
+                    done_state["done"] += 1
+                    progress.progress(done_state["done"] / total_indices if total_indices else 1.0)
+                    return resp
+
+                def _uuid_fn(instance: Dict[str, str], index_name: str) -> Dict[str, Any]:
+                    return fetch_index_uuids(
+                        instance,
+                        index_name,
+                        start_dt,
+                        end_dt,
+                        timestamp_field,
+                        uuid_field,
+                        headers,
+                        search_index,
+                    )
+
+                report_rows, builder_errors = build_index_activity_report(
+                    target_instances,
+                    runtime_indices_by_instance,
+                    period_label,
+                    start_dt,
+                    end_dt,
+                    include_uuids,
+                    _count_fn,
+                    _uuid_fn,
+                )
+                st.session_state.index_report_rows = report_rows
+                st.session_state.index_report_errors = report_errors + builder_errors
+                st.session_state.index_report_df = pd.DataFrame(report_rows)
+
+        if not st.session_state.get("index_report_df", pd.DataFrame()).empty:
+            index_report_df = st.session_state.index_report_df
+            st.dataframe(index_report_df, use_container_width=True)
+            csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                "Download CSV",
+                data=index_report_df.to_csv(index=False).encode("utf-8"),
+                file_name=csv_name,
+                mime="text/csv",
+                key="download_index_activity_csv",
+            )
+
+        if st.session_state.get("index_report_errors"):
+            with st.expander("Errors / logs", expanded=False):
+                st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
