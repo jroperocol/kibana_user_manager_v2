@@ -136,6 +136,10 @@ def extract_total_hits(response: Dict[str, Any]) -> int:
     return int(total or 0)
 
 
+def parse_activity_count(response: Dict[str, Any]) -> int:
+    return extract_total_hits({"data": response})
+
+
 def extract_uuid_rows(response: Dict[str, Any], timestamp_field: str = "timestamp") -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     hits = response.get("data", {}).get("hits", {}).get("hits", [])
@@ -146,6 +150,22 @@ def extract_uuid_rows(response: Dict[str, Any], timestamp_field: str = "timestam
             {
                 "call_uuid": str(call_data.get("uuid", "")),
                 "timestamp": str(source.get(timestamp_field, "")),
+            }
+        )
+    return rows
+
+
+def parse_uuid_hits(response: Dict[str, Any]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    hits = response.get("hits", {}).get("hits", [])
+    for hit in hits:
+        source = hit.get("_source", {}) or {}
+        call = source.get("call", {}) or {}
+        rows.append(
+            {
+                "call_uuid": str(call.get("uuid", "")),
+                "timestamp": str(source.get("timestamp", "")),
+                "index_name": str(hit.get("_index", "")),
             }
         )
     return rows
@@ -168,6 +188,15 @@ def filter_indices(indices: List[Dict[str, Any]], include_system: bool = False) 
     if include_system:
         return indices
     return [item for item in indices if not is_system_index(item.get("index", ""))]
+
+
+def filter_operational_indices(indices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    result: List[Dict[str, Any]] = []
+    for item in indices:
+        name = item.get("index") or item.get("index_name") or ""
+        if not is_system_index(str(name)):
+            result.append(item)
+    return result
 
 
 def count_index_activity(

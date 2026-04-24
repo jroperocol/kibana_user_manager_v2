@@ -15,9 +15,12 @@ from index_activity import (
     derive_search_pattern_from_index,
     extract_total_hits,
     extract_uuid_rows,
+    filter_operational_indices,
     fetch_index_uuids,
     filter_indices,
     list_indices,
+    parse_activity_count,
+    parse_uuid_hits,
     build_period_range,
     parse_activity_buckets,
 )
@@ -186,6 +189,13 @@ class TestIndexFilteringAndPattern(unittest.TestCase):
         parsed = extract_uuid_rows(resp)
         self.assertEqual(parsed[0]["call_uuid"], "u1")
         self.assertEqual(parsed[1]["call_uuid"], "u2")
+        self.assertEqual(parse_activity_count(resp["data"]), 2)
+        parsed2 = parse_uuid_hits(resp["data"])
+        self.assertEqual(parsed2[0]["call_uuid"], "u1")
+
+    def test_filter_operational_indices(self):
+        filtered = filter_operational_indices([{"index": ".kibana"}, {"index": "a_ivrs-2026"}])
+        self.assertEqual(filtered, [{"index": "a_ivrs-2026"}])
 
     def test_filter_indices_excludes_system_by_default(self):
         indices = [

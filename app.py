@@ -22,10 +22,10 @@ from index_activity import (
     build_search_url,
     build_uuid_query,
     derive_search_pattern_from_index,
-    extract_total_hits,
-    extract_uuid_rows,
-    filter_indices,
+    filter_operational_indices,
     list_indices as index_list_indices,
+    parse_activity_count,
+    parse_uuid_hits,
 )
 from utils_io import (
     load_instances_from_csv,
@@ -1346,7 +1346,7 @@ with tab_index:
                     if index_resp.get("ok"):
                         payload = index_resp.get("data", [])
                         parsed_rows = payload if isinstance(payload, list) else []
-                        parsed_rows = [item for item in filter_indices(parsed_rows, include_system=False) if not str(item.get("index", "")).startswith(".")]
+                        parsed_rows = [item for item in filter_operational_indices(parsed_rows) if not str(item.get("index", "")).startswith(".")]
                         for item in parsed_rows:
                             indices_rows.append(
                                 {
@@ -1442,7 +1442,7 @@ with tab_index:
                             status_placeholder.caption(f"Failed {instance['name']}: {error_text}")
                             continue
 
-                        activity_count = extract_total_hits(count_resp)
+                        activity_count = parse_activity_count(count_resp.get("data", {}))
                         if not include_uuids:
                             report_rows.append(
                                 {
@@ -1475,7 +1475,7 @@ with tab_index:
                                     }
                                 )
                             else:
-                                uuid_rows = extract_uuid_rows(uuid_resp, "timestamp")
+                                uuid_rows = parse_uuid_hits(uuid_resp.get("data", {}))
                                 warning = ""
                                 if activity_count > 10000:
                                     warning = "Total exceeds 10000. CSV includes first 10000 UUIDs only."
