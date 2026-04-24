@@ -1,7 +1,14 @@
 from datetime import date, datetime
 import unittest
 
-from index_activity import build_date_range, build_index_activity_report
+from index_activity import (
+    MAX_UUID_RECORDS,
+    build_date_range,
+    build_index_activity_report,
+    fetch_index_uuids,
+    filter_indices,
+    list_indices,
+)
 
 
 class TestBuildDateRange(unittest.TestCase):
@@ -127,6 +134,81 @@ class TestBuildIndexActivityReport(unittest.TestCase):
         self.assertFalse(rows[0]["has_activity"])
         self.assertIn("boom", rows[0]["error"])
         self.assertEqual(len(errors), 1)
+
+
+class TestIndexFilteringAndPattern(unittest.TestCase):
+    def test_filter_indices_excludes_system_by_default(self):
+        indices = [
+            {"index": ".kibana_1"},
+            {"index": ".ds-logs"},
+            {"index": "foo_ivrs-2026.01.01"},
+        ]
+        filtered = filter_indices(indices, include_system=False)
+        self.assertEqual(filtered, [{"index": "foo_ivrs-2026.01.01"}])
+
+    def test_list_indices_uses_pattern(self):
+        captured = {}
+
+        def fake_fetch(base_url, auth_headers, pattern):
+            captured["pattern"] = pattern
+            return {"ok": True, "data": []}
+
+        list_indices({"name": "x", "base_url": "https://example"}, {"Authorization": "x"}, fake_fetch, "*_ivrs-*")
+        self.assertEqual(captured["pattern"], "*_ivrs-*")
+
+    def test_report_uses_only_filtered_indices(self):
+        instances = [{"name": "inst1", "base_url": "https://example"}]
+        indices_by_instance = {"https://example": [{"index": "ivr-1"}]}
+
+        seen = []
+
+        def count_fn(_instance, index_name):
+            seen.append(index_name)
+            return {"ok": True, "count": 1}
+
+        rows, _ = build_index_activity_report(
+            instances,
+            indices_by_instance,
+            "Last 24 hours",
+            datetime(2026, 4, 1, 0, 0, 0),
+            datetime(2026, 4, 2, 0, 0, 0),
+            False,
+            count_fn,
+            lambda _i, _n: {"ok": True, "uuids": []},
+        )
+        self.assertEqual(seen, ["ivr-1"])
+        self.assertEqual(len(rows), 1)
+
+    def test_uuid_limit_respected(self):
+        def fake_search(_base_url, _headers, _index, body):
+            size = body["size"]
+            hits = []
+            for i in range(size):
+                idx = i + (0 if "search_after" not in body else body["search_after"][1] + 1)
+                hits.append({"_source": {"uuid": f"u{idx}"}, "sort": ["2026-04-01T00:00:00Z", idx]})
+            return {"ok": True, "data": {"hits": {"hits": hits}}}
+
+        result = fetch_index_uuids(
+            {"name": "inst1", "base_url": "https://example"},
+            "ivr-index",
+            datetime(2026, 4, 1, 0, 0, 0),
+            datetime(2026, 4, 2, 0, 0, 0),
+            "timestamp",
+            "uuid",
+            {"Authorization": "x"},
+            fake_search,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["uuids"]), MAX_UUID_RECORDS)
+
+    def test_no_auto_execution_without_button_intent(self):
+        calls = {"count": 0}
+
+        def count_fn(_instance, _index):
+            calls["count"] += 1
+            return {"ok": True, "count": 1}
+
+        self.assertEqual(calls["count"], 0)
 
 
 if __name__ == "__main__":

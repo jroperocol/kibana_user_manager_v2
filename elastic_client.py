@@ -91,9 +91,10 @@ def list_roles(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
     return _request("GET", f"{base_url}/_security/role", auth_headers)
 
 
-def list_indices(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
-    """GET /_cat/indices?format=json"""
-    response = _request("GET", f"{base_url}/_cat/indices", auth_headers, params={"format": "json"})
+def list_indices(base_url: str, auth_headers: Dict[str, str], pattern: str = "*") -> Dict[str, Any]:
+    """GET /_cat/indices/{pattern}?format=json"""
+    safe_pattern = (pattern or "*").strip() or "*"
+    response = _request("GET", f"{base_url}/_cat/indices/{safe_pattern}", auth_headers, params={"format": "json"})
     if not response.get("ok"):
         return {
             "ok": False,

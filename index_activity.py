@@ -4,8 +4,22 @@ from datetime import date, datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
-MAX_UUID_RECORDS = 50000
+MAX_UUID_RECORDS = 10000
 UUID_PAGE_SIZE = 1000
+SYSTEM_INDEX_PREFIXES = (
+    ".",
+    ".apm-",
+    ".async-search",
+    ".ds-",
+    ".kibana",
+    ".security",
+    ".internal-",
+    ".monitoring",
+    ".logs-",
+    ".metrics-",
+    ".slm-history",
+    ".inference",
+)
 
 
 def to_es_datetime(value: datetime) -> str:
@@ -51,9 +65,20 @@ def build_date_range(
 def list_indices(
     instance: Dict[str, str],
     auth_headers: Dict[str, str],
-    fetch_indices_fn: Callable[[str, Dict[str, str]], Dict[str, Any]],
+    fetch_indices_fn: Callable[..., Dict[str, Any]],
+    pattern: str = "*_ivrs-*",
 ) -> Dict[str, Any]:
-    return fetch_indices_fn(instance["base_url"], auth_headers)
+    return fetch_indices_fn(instance["base_url"], auth_headers, pattern=pattern)
+
+
+def is_system_index(name: str) -> bool:
+    return str(name or "").startswith(SYSTEM_INDEX_PREFIXES)
+
+
+def filter_indices(indices: List[Dict[str, Any]], include_system: bool = False) -> List[Dict[str, Any]]:
+    if include_system:
+        return indices
+    return [item for item in indices if not is_system_index(item.get("index", ""))]
 
 
 def count_index_activity(

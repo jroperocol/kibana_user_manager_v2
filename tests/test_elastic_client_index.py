@@ -49,6 +49,8 @@ class TestElasticClientIndexHelpers(unittest.TestCase):
                 "store.size": "5mb",
             },
         )
+        called_url = mock_request.call_args.kwargs["url"]
+        self.assertTrue(called_url.endswith("/_cat/indices/*"))
 
     @patch("elastic_client.requests.request")
     def test_list_indices_returns_clear_error(self, mock_request):
@@ -58,6 +60,13 @@ class TestElasticClientIndexHelpers(unittest.TestCase):
 
         self.assertFalse(resp["ok"])
         self.assertIn("Failed to list indices", resp["message"])
+
+    @patch("elastic_client.requests.request")
+    def test_list_indices_custom_pattern(self, mock_request):
+        mock_request.return_value = _FakeResponse(payload=[])
+        elastic_client.list_indices("https://example", {"Authorization": "x"}, pattern="*_ivrs-*")
+        called_url = mock_request.call_args.kwargs["url"]
+        self.assertTrue(called_url.endswith("/_cat/indices/*_ivrs-*"))
 
     @patch("elastic_client.requests.request")
     def test_search_index_returns_clear_error(self, mock_request):
