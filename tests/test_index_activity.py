@@ -3,6 +3,7 @@ import unittest
 
 from index_activity import (
     MAX_UUID_RECORDS,
+    UUID_PAGE_SIZE,
     INDEX_PATTERN_SUFFIX,
     build_activity_agg_query,
     build_activity_rows_for_instance,
@@ -165,6 +166,12 @@ class TestIndexFilteringAndPattern(unittest.TestCase):
     def test_build_uuid_query_includes_only_call_uuid_and_timestamp(self):
         body = build_uuid_query("now-90d", "now")
         self.assertEqual(body["_source"]["includes"], ["call.uuid", "timestamp"])
+
+    def test_build_uuid_query_supports_pagination_defaults(self):
+        body = build_uuid_query("now-1d", "now", from_offset=2000, size=UUID_PAGE_SIZE)
+        self.assertEqual(body["from"], 2000)
+        self.assertEqual(body["size"], UUID_PAGE_SIZE)
+        self.assertEqual(body["sort"], [{"timestamp": "asc"}])
 
     def test_derive_search_pattern_from_index(self):
         self.assertEqual(

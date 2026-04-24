@@ -21,6 +21,11 @@ SYSTEM_INDEX_PREFIXES = (
     ".inference",
 )
 INDEX_PATTERN_SUFFIX = "*_ivrs-*"
+BATCH_SIZE = 10
+REQUEST_TIMEOUT = 45
+MAX_UI_ROWS = 1000
+UUID_PAGE_SIZE = 1000
+MAX_UUID_ROWS_TOTAL = 50000
 
 
 def to_es_datetime(value: datetime) -> str:
@@ -101,10 +106,16 @@ def build_count_query(period_gte: str, period_lt: str, timestamp_field: str = "t
     }
 
 
-def build_uuid_query(period_gte: str, period_lt: str, timestamp_field: str = "timestamp") -> Dict[str, Any]:
+def build_uuid_query(
+    period_gte: str,
+    period_lt: str,
+    timestamp_field: str = "timestamp",
+    from_offset: int = 0,
+    size: int = UUID_PAGE_SIZE,
+) -> Dict[str, Any]:
     return {
-        "from": 0,
-        "size": 10000,
+        "from": from_offset,
+        "size": size,
         "track_total_hits": True,
         "_source": {
             "includes": [
@@ -120,6 +131,7 @@ def build_uuid_query(period_gte: str, period_lt: str, timestamp_field: str = "ti
                 }
             }
         },
+        "sort": [{timestamp_field: "asc"}],
     }
 
 

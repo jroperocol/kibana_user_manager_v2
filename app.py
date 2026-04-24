@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import gc
 import io
 from datetime import datetime
 from typing import Any, Dict, List
@@ -16,7 +17,12 @@ from create_users_helpers import (
 )
 from elastic_client import create_user, delete_user, list_indices as es_list_indices, list_roles, list_users, search_index, test_connection
 from index_activity import (
+    BATCH_SIZE,
     INDEX_PATTERN_SUFFIX,
+    MAX_UI_ROWS,
+    MAX_UUID_ROWS_TOTAL,
+    REQUEST_TIMEOUT,
+    UUID_PAGE_SIZE,
     build_count_query,
     build_period_range,
     build_search_url,
@@ -222,6 +228,8 @@ if "loaded_indices_df" not in st.session_state:
     st.session_state.loaded_indices_df = pd.DataFrame()
 if "index_report_df" not in st.session_state:
     st.session_state.index_report_df = pd.DataFrame()
+if "index_report_partial_df" not in st.session_state:
+    st.session_state.index_report_partial_df = pd.DataFrame()
 if "index_pattern" not in st.session_state:
     st.session_state.index_pattern = "*_ivrs-*"
 if "include_system_indices" not in st.session_state:
@@ -1333,46 +1341,6 @@ with tab_index:
         include_uuids = st.checkbox("Include UUIDs in CSV", value=False, key="index_include_uuids")
         st.caption("Including UUIDs can make the CSV larger.")
 
-        if st.button("Load operational indices", key="load_index_list"):
-            if not headers:
-                st.warning("Completa autenticación.")
-            elif not target_instances:
-                st.warning("Selecciona al menos una instancia.")
-            else:
-                indices_rows: List[Dict[str, object]] = []
-                list_errors: List[Dict[str, object]] = []
-                for instance in target_instances:
-                    index_resp = index_list_indices(instance, headers, es_list_indices, INDEX_PATTERN_SUFFIX)
-                    if index_resp.get("ok"):
-                        payload = index_resp.get("data", [])
-                        parsed_rows = payload if isinstance(payload, list) else []
-                        parsed_rows = [item for item in filter_operational_indices(parsed_rows) if not str(item.get("index", "")).startswith(".")]
-                        for item in parsed_rows:
-                            indices_rows.append(
-                                {
-                                    "instance_name": instance["name"],
-                                    "base_url": instance["base_url"],
-                                    "index_name": item.get("index", ""),
-                                    "health": item.get("health", ""),
-                                    "status": item.get("status", ""),
-                                    "docs_count": item.get("docs.count", ""),
-                                    "store_size": item.get("store.size", ""),
-                                }
-                            )
-                    else:
-                        list_errors.append(
-                            {
-                                "instance_name": instance["name"],
-                                "base_url": instance["base_url"],
-                                "index_name": "",
-                                "error": short_message(index_resp),
-                            }
-                        )
-                st.session_state.loaded_indices_df = pd.DataFrame(indices_rows)
-                st.session_state.index_report_errors = list_errors
-                st.session_state.index_report_df = pd.DataFrame()
-                st.session_state.index_report_rows = []
-
         loaded_indices_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
         if not loaded_indices_df.empty:
             total_instances = int(loaded_indices_df["instance_name"].nunique()) if "instance_name" in loaded_indices_df.columns else 0
@@ -1411,24 +1379,33 @@ with tab_index:
                 report_errors: List[Dict[str, object]] = []
                 loaded_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
                 total_instances = len(target_instances)
+                active_count = 0
+                no_activity_count = 0
+                failed_count = 0
+                completed_count = 0
+                total_uuid_rows = 0
+                st.session_state.index_report_rows = []
+                st.session_state.index_report_partial_df = pd.DataFrame()
 
-                for instance_pos, instance in enumerate(target_instances, start=1):
-                    started_at = datetime.utcnow()
-                    status_placeholder.caption(f"Checking {instance['name']}...")
-                    instance_loaded_df = loaded_df[loaded_df["base_url"] == instance["base_url"]] if not loaded_df.empty else pd.DataFrame()
-                    loaded_index_names = instance_loaded_df["index_name"].astype(str).tolist() if not instance_loaded_df.empty else []
-                    derived_patterns = [derive_search_pattern_from_index(index_name) for index_name in loaded_index_names]
-                    search_patterns = list(dict.fromkeys([p for p in derived_patterns if p])) or [INDEX_PATTERN_SUFFIX]
+                batches = [target_instances[i : i + BATCH_SIZE] for i in range(0, total_instances, BATCH_SIZE)]
+                total_batches = len(batches)
+                for batch_idx, batch in enumerate(batches, start=1):
+                    for instance in batch:
+                        started_at = datetime.utcnow()
+                        status_placeholder.caption(f"Batch {batch_idx}/{total_batches} - Checking {instance['name']}...")
+                        instance_loaded_df = loaded_df[loaded_df["base_url"] == instance["base_url"]] if not loaded_df.empty else pd.DataFrame()
+                        loaded_index_names = instance_loaded_df["index_name"].astype(str).tolist() if not instance_loaded_df.empty else []
+                        derived_patterns = [derive_search_pattern_from_index(index_name) for index_name in loaded_index_names]
+                        search_patterns = list(dict.fromkeys([p for p in derived_patterns if p])) or [INDEX_PATTERN_SUFFIX]
 
-                    for pattern in search_patterns:
-                        search_url = build_search_url(instance["base_url"], pattern)
-                        count_body = build_count_query(period_gte, period_lt, "timestamp")
-                        count_resp = search_index(instance["base_url"], headers, pattern, count_body, timeout=60)
-                        if not count_resp.get("ok"):
-                            error_text = f"{count_resp.get('message', 'Request failed')} | url={search_url}"
-                            report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": error_text})
-                            report_rows.append(
-                                {
+                        for pattern in search_patterns:
+                            search_url = build_search_url(instance["base_url"], pattern)
+                            count_resp = search_index(instance["base_url"], headers, pattern, build_count_query(period_gte, period_lt, "timestamp"), timeout=REQUEST_TIMEOUT)
+                            if not count_resp.get("ok"):
+                                error_text = f"{count_resp.get('message', 'Request failed')} | url={search_url}"
+                                failed_count += 1
+                                report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": error_text})
+                                report_rows.append({
                                     "report_date": datetime.utcnow().date().isoformat(),
                                     "instance_name": instance["name"],
                                     "base_url": instance["base_url"],
@@ -1436,16 +1413,20 @@ with tab_index:
                                     "period_label": period_label,
                                     "activity_count": 0,
                                     "has_activity": False,
+                                    "status": "failed",
                                     "error": error_text,
-                                }
-                            )
-                            status_placeholder.caption(f"Failed {instance['name']}: {error_text}")
-                            continue
+                                })
+                                continue
 
-                        activity_count = parse_activity_count(count_resp.get("data", {}))
-                        if not include_uuids:
-                            report_rows.append(
-                                {
+                            activity_count = parse_activity_count(count_resp.get("data", {}))
+                            row_status = "active" if activity_count > 0 else "no_activity"
+                            if activity_count > 0:
+                                active_count += 1
+                            else:
+                                no_activity_count += 1
+
+                            if not include_uuids or activity_count <= 0:
+                                report_rows.append({
                                     "report_date": datetime.utcnow().date().isoformat(),
                                     "instance_name": instance["name"],
                                     "base_url": instance["base_url"],
@@ -1453,15 +1434,44 @@ with tab_index:
                                     "period_label": period_label,
                                     "activity_count": activity_count,
                                     "has_activity": activity_count > 0,
+                                    "status": row_status,
                                     "error": "",
-                                }
-                            )
-                        else:
-                            uuid_body = build_uuid_query(period_gte, period_lt, "timestamp")
-                            uuid_resp = search_index(instance["base_url"], headers, pattern, uuid_body, timeout=60)
-                            if not uuid_resp.get("ok"):
-                                report_rows.append(
-                                    {
+                                    "call_uuid": "",
+                                    "timestamp": "",
+                                    "uuid_export_limited": False,
+                                    "uuid_export_note": "",
+                                })
+                            else:
+                                offset = 0
+                                uuid_limited = False
+                                uuid_note = ""
+                                instance_uuid_rows: List[Dict[str, str]] = []
+                                while offset < activity_count and total_uuid_rows < MAX_UUID_ROWS_TOTAL:
+                                    remaining_global = MAX_UUID_ROWS_TOTAL - total_uuid_rows
+                                    page_size = min(UUID_PAGE_SIZE, remaining_global)
+                                    uuid_resp = search_index(
+                                        instance["base_url"],
+                                        headers,
+                                        pattern,
+                                        build_uuid_query(period_gte, period_lt, "timestamp", from_offset=offset, size=page_size),
+                                        timeout=REQUEST_TIMEOUT,
+                                    )
+                                    if not uuid_resp.get("ok"):
+                                        report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": str(uuid_resp.get("message", "UUID request failed"))})
+                                        break
+                                    parsed_page = parse_uuid_hits(uuid_resp.get("data", {}))
+                                    if not parsed_page:
+                                        break
+                                    instance_uuid_rows.extend(parsed_page)
+                                    total_uuid_rows += len(parsed_page)
+                                    offset += len(parsed_page)
+                                    if len(parsed_page) < page_size:
+                                        break
+                                if total_uuid_rows >= MAX_UUID_ROWS_TOTAL and activity_count > len(instance_uuid_rows):
+                                    uuid_limited = True
+                                    uuid_note = "UUID export reached safe limit. Count is complete, UUID list is partial."
+                                if not instance_uuid_rows:
+                                    report_rows.append({
                                         "report_date": datetime.utcnow().date().isoformat(),
                                         "instance_name": instance["name"],
                                         "base_url": instance["base_url"],
@@ -1469,19 +1479,16 @@ with tab_index:
                                         "period_label": period_label,
                                         "activity_count": activity_count,
                                         "has_activity": activity_count > 0,
+                                        "status": row_status,
+                                        "error": "",
                                         "call_uuid": "",
                                         "timestamp": "",
-                                        "error": str(uuid_resp.get("message", "UUID request failed")),
-                                    }
-                                )
-                            else:
-                                uuid_rows = parse_uuid_hits(uuid_resp.get("data", {}))
-                                warning = ""
-                                if activity_count > 10000:
-                                    warning = "Total exceeds 10000. CSV includes first 10000 UUIDs only."
-                                if not uuid_rows:
-                                    report_rows.append(
-                                        {
+                                        "uuid_export_limited": uuid_limited,
+                                        "uuid_export_note": uuid_note,
+                                    })
+                                else:
+                                    for uuid_row in instance_uuid_rows:
+                                        report_rows.append({
                                             "report_date": datetime.utcnow().date().isoformat(),
                                             "instance_name": instance["name"],
                                             "base_url": instance["base_url"],
@@ -1489,41 +1496,26 @@ with tab_index:
                                             "period_label": period_label,
                                             "activity_count": activity_count,
                                             "has_activity": activity_count > 0,
-                                            "call_uuid": "",
-                                            "timestamp": "",
-                                            "error": warning,
-                                        }
-                                    )
-                                else:
-                                    for uuid_row in uuid_rows:
-                                        report_rows.append(
-                                            {
-                                                "report_date": datetime.utcnow().date().isoformat(),
-                                                "instance_name": instance["name"],
-                                                "base_url": instance["base_url"],
-                                                "index_pattern": pattern,
-                                                "period_label": period_label,
-                                                "activity_count": activity_count,
-                                                "has_activity": activity_count > 0,
-                                                "call_uuid": uuid_row.get("call_uuid", ""),
-                                                "timestamp": uuid_row.get("timestamp", ""),
-                                                "error": warning,
-                                            }
-                                        )
+                                            "status": row_status,
+                                            "error": "",
+                                            "call_uuid": uuid_row.get("call_uuid", ""),
+                                            "timestamp": uuid_row.get("timestamp", ""),
+                                            "uuid_export_limited": uuid_limited,
+                                            "uuid_export_note": uuid_note,
+                                        })
+                            del count_resp
 
-                    elapsed_sec = (datetime.utcnow() - started_at).total_seconds()
-                    log_event(
-                        instance["name"],
-                        instance["base_url"],
-                        "index_report_instance_done",
-                        None,
-                        f"rows={len([r for r in report_rows if r.get('instance_name') == instance['name']])}",
-                        f"elapsed_sec={elapsed_sec:.2f}",
-                    )
-                    overall_progress.progress(instance_pos / total_instances)
-                    status_placeholder.caption(
-                        f"Completed {instance['name']}: {sum(int(r.get('activity_count', 0)) for r in report_rows if r.get('instance_name') == instance['name'])} calls"
-                    )
+                        completed_count += 1
+                        elapsed_sec = (datetime.utcnow() - started_at).total_seconds()
+                        log_event(instance["name"], instance["base_url"], "index_report_instance_done", None, f"elapsed_sec={elapsed_sec:.2f}", "")
+                        overall_progress.progress(completed_count / total_instances if total_instances else 1.0)
+                        status_placeholder.caption(
+                            f"Completed {completed_count}/{total_instances} | Active: {active_count} | No activity: {no_activity_count} | Failed: {failed_count}"
+                        )
+
+                    st.session_state.index_report_rows.extend(report_rows[len(st.session_state.index_report_rows):])
+                    st.session_state.index_report_partial_df = pd.DataFrame(st.session_state.index_report_rows)
+                    gc.collect()
 
                 st.session_state.index_report_rows = report_rows
                 st.session_state.index_report_errors = report_errors
@@ -1531,7 +1523,9 @@ with tab_index:
 
         if not st.session_state.get("index_report_df", pd.DataFrame()).empty:
             index_report_df = st.session_state.index_report_df
-            st.dataframe(index_report_df, use_container_width=True)
+            st.dataframe(index_report_df.head(MAX_UI_ROWS), use_container_width=True)
+            if len(index_report_df) > MAX_UI_ROWS:
+                st.caption(f"Showing first {MAX_UI_ROWS} rows.")
             csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
             st.download_button(
                 "Download CSV",
@@ -1544,3 +1538,13 @@ with tab_index:
         if st.session_state.get("index_report_errors"):
             with st.expander("Errors / logs", expanded=False):
                 st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
+        elif not st.session_state.get("index_report_partial_df", pd.DataFrame()).empty:
+            partial_df = st.session_state.index_report_partial_df
+            csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                "Download partial CSV",
+                data=partial_df.to_csv(index=False).encode("utf-8"),
+                file_name=csv_name,
+                mime="text/csv",
+                key="download_index_activity_partial_csv",
+            )
