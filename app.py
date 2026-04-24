@@ -9,6 +9,11 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
+from create_users_helpers import (
+    get_target_instances as resolve_target_instances,
+    init_default_users_state,
+    resolve_destination,
+)
 from elastic_client import create_user, delete_user, list_indices as es_list_indices, list_roles, list_users, search_index, test_connection
 from index_activity import (
     build_date_range,
@@ -164,9 +169,11 @@ DEFAULT_SUPERUSERS = [
 ]
 
 if "default_users_df" not in st.session_state:
-    st.session_state.default_users_df = pd.DataFrame([{**dict(row), "selected": False} for row in DEFAULT_SUPERUSERS])
+    default_df, default_selection = init_default_users_state(DEFAULT_SUPERUSERS)
+    st.session_state.default_users_df = default_df
 if "default_users_selection" not in st.session_state:
-    st.session_state.default_users_selection = []
+    _, default_selection = init_default_users_state(DEFAULT_SUPERUSERS)
+    st.session_state.default_users_selection = default_selection
 
 
 if "instances" not in st.session_state:
@@ -199,6 +206,12 @@ if "index_report_errors" not in st.session_state:
     st.session_state.index_report_errors = []
 if "authenticated_instances" not in st.session_state:
     st.session_state.authenticated_instances = []
+if "auth_checked" not in st.session_state:
+    st.session_state.auth_checked = False
+if "cached_auth_headers" not in st.session_state:
+    st.session_state.cached_auth_headers = {}
+if "create_users_destination" not in st.session_state:
+    st.session_state.create_users_destination = "Todas"
 if "selected_instances" not in st.session_state:
     st.session_state.selected_instances = []
 if "loaded_indices_df" not in st.session_state:
@@ -375,10 +388,33 @@ def build_auth_report_df() -> pd.DataFrame:
 
 def refresh_auth_report_df() -> None:
     st.session_state.auth_report_df = build_auth_report_df()
+    sync_authenticated_instances()
 
 
 def has_auth_report() -> bool:
     return not st.session_state.auth_report_df.empty
+
+
+def sync_authenticated_instances() -> None:
+    authenticated: List[Dict[str, str]] = []
+    for item in st.session_state.instances:
+        auth_state = st.session_state.instance_auth.get(item["base_url"], {})
+        if bool(auth_state.get("auth_ok", False)):
+            authenticated.append({"name": item["name"], "base_url": item["base_url"]})
+    st.session_state.authenticated_instances = authenticated
+
+
+def get_target_instances(destination: str) -> List[Dict[str, str]]:
+    authenticated = st.session_state.get("authenticated_instances", [])
+    return resolve_target_instances(destination, authenticated)
+
+
+def get_effective_auth_headers() -> Dict[str, str]:
+    headers = get_auth_headers()
+    if headers:
+        st.session_state.cached_auth_headers = headers
+        return headers
+    return st.session_state.get("cached_auth_headers", {})
 
 
 def get_operable_instances(all_instances: Dict[str, str]) -> Dict[str, str]:
@@ -433,6 +469,9 @@ def reset_auth_dependent_state() -> None:
     st.session_state.roles_data = {}
     st.session_state.create_roles_cache = {}
     st.session_state.create_roles_cache_key = None
+    st.session_state.authenticated_instances = []
+    st.session_state.auth_checked = False
+    st.session_state.cached_auth_headers = {}
 
 
 def reset_delete_section_state() -> None:
@@ -532,6 +571,7 @@ with st.sidebar:
         elif not st.session_state.instances:
             st.warning("Agrega al menos una instancia.")
         else:
+            st.session_state.cached_auth_headers = headers
             total = len(st.session_state.instances)
             progress = st.progress(0)
             progress_text = st.empty()
@@ -565,6 +605,7 @@ with st.sidebar:
                 progress_text.caption(t("auth_verified_progress", done=index, total=total))
 
             refresh_auth_report_df()
+            st.session_state.auth_checked = True
             report_df = st.session_state.auth_report_df
             ok_count = int((report_df["auth_ok"] == True).sum()) if not report_df.empty else 0
             fail_count = int((report_df["auth_ok"] == False).sum()) if not report_df.empty else 0
@@ -600,6 +641,15 @@ with st.sidebar:
     show_logs = st.checkbox(t("show_logs"), value=False)
     if show_logs:
         with st.expander("Logs", expanded=True):
+            st.caption(f"debug.authenticated_instances_count={len(st.session_state.get('authenticated_instances', []))}")
+            st.caption(f"debug.create_users_destination={st.session_state.get('create_users_destination', 'Todas')}")
+            st.caption(
+                f"debug.target_instances_count={len(get_target_instances(st.session_state.get('create_users_destination', 'Todas')))}"
+            )
+            st.caption(
+                "debug.default_users_df="
+                + ("initialized" if not st.session_state.get("default_users_df", pd.DataFrame()).empty else "empty")
+            )
             st.dataframe(pd.DataFrame(st.session_state.auth_logs[-300:]), use_container_width=True)
 
     st.divider()
@@ -882,9 +932,13 @@ with tab_create:
     st.subheader("Crear usuarios")
     all_instances = instances_dict()
     operable_instances = get_operable_instances(all_instances)
+    authenticated_instances = st.session_state.get("authenticated_instances", [])
+    if not authenticated_instances and operable_instances:
+        authenticated_instances = [{"name": name, "base_url": url} for name, url in operable_instances.items()]
+        st.session_state.authenticated_instances = authenticated_instances
 
     if has_auth_report():
-        not_auth_count = len(all_instances) - len(operable_instances)
+        not_auth_count = len(all_instances) - len(authenticated_instances)
         if not_auth_count > 0:
             st.caption(f"{not_auth_count} instancias no autenticadas. Ver reporte para detalles.")
     else:
@@ -892,23 +946,33 @@ with tab_create:
 
     if not all_instances:
         st.info("No hay instancias configuradas.")
-    elif not operable_instances:
+    elif not authenticated_instances:
         st.warning("No hay instancias autenticadas para operar.")
     else:
-        target = st.selectbox("Instancia destino", ["Todas"] + list(operable_instances.keys()), key="create_instance")
-        headers = get_auth_headers()
+        authenticated_names = [item["name"] for item in authenticated_instances]
+        destination_options = ["Todas"] + authenticated_names
+        st.session_state.create_users_destination = resolve_destination(
+            st.session_state.get("create_users_destination", "Todas"),
+            authenticated_instances,
+        )
+        if st.session_state.create_users_destination == "Todas" and not authenticated_instances:
+            st.session_state.create_users_destination = destination_options[0]
+        target = st.selectbox("Instancia destino", destination_options, key="create_users_destination")
+        target_instances_data = get_target_instances(target)
+        target_instances = [(item["name"], item["base_url"]) for item in target_instances_data]
+        headers = get_effective_auth_headers()
 
         if not headers:
             st.warning("Completa autenticación para consultar roles y crear usuarios.")
         else:
-            target_instances = list(operable_instances.items()) if target == "Todas" else [(target, operable_instances[target])]
             roles_cache_key = {
                 "instances": tuple(target_instances),
                 "mode": st.session_state.auth.get("mode", ""),
                 "username": st.session_state.auth.get("username", ""),
                 "api_key": st.session_state.auth.get("api_key", ""),
             }
-            if st.session_state.get("create_roles_cache_key") != roles_cache_key:
+            should_load_roles = bool(target_instances) and target != "Todas"
+            if should_load_roles and st.session_state.get("create_roles_cache_key") != roles_cache_key:
                 all_role_names = set()
                 role_errors = 0
                 for instance_name, instance_url in target_instances:
@@ -922,15 +986,18 @@ with tab_create:
                 st.session_state.create_roles_cache = {"all_role_names": all_role_names, "role_errors": role_errors}
             else:
                 cache_data = st.session_state.get("create_roles_cache", {"all_role_names": set(), "role_errors": 0})
-                all_role_names = set(cache_data.get("all_role_names", set()))
-                role_errors = int(cache_data.get("role_errors", 0))
+                all_role_names = set(cache_data.get("all_role_names", set())) if should_load_roles else set()
+                role_errors = int(cache_data.get("role_errors", 0)) if should_load_roles else 0
 
             if role_errors:
                 st.caption(f"Roles no disponibles en {role_errors} instancia(s).")
 
             available_roles = sorted(all_role_names)
             st.caption("Roles disponibles")
-            st.write(available_roles if available_roles else "No se pudieron cargar roles.")
+            if target == "Todas":
+                st.write("Selecciona una instancia específica para cargar roles en creación personalizada.")
+            else:
+                st.write(available_roles if available_roles else "No se pudieron cargar roles.")
 
             st.markdown("#### Crear un usuario")
             with st.form("single_create_form"):
@@ -1005,6 +1072,14 @@ with tab_create:
                 )
 
                 apply_password = st.button("Aplicar a todos", key="apply_default_superuser_password")
+                if st.button("Reset default users selection", key="reset_default_users_selection"):
+                    reset_df = st.session_state.default_users_df.copy()
+                    if "selected" in reset_df.columns:
+                        reset_df["selected"] = True
+                    st.session_state.default_users_df = reset_df
+                    st.session_state.default_users_selection = (
+                        reset_df["username"].astype(str).tolist() if "username" in reset_df.columns else []
+                    )
 
                 if apply_password:
                     df_pwd = st.session_state.default_users_df.copy()
@@ -1043,7 +1118,8 @@ with tab_create:
                     value=False,
                 )
 
-                if st.button("Crear usuarios default", type="primary"):
+                can_create_default = bool(target_instances) and bool(selected_default_rows) and bool(confirm_default_superusers)
+                if st.button("Crear usuarios default", type="primary", disabled=not can_create_default):
                     if not confirm_default_superusers:
                         st.error("Debes confirmar antes de crear usuarios SUPERUSER.")
                     elif not selected_default_rows:
@@ -1212,7 +1288,6 @@ with tab_index:
     all_instances = instances_dict()
     operable_instances = get_operable_instances(all_instances)
     headers = get_auth_headers()
-    st.session_state.authenticated_instances = list(operable_instances.keys())
 
     if has_auth_report():
         not_auth_count = len(all_instances) - len(operable_instances)
