@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import gc
 import io
 from datetime import datetime
 from typing import Any, Dict, List
@@ -9,7 +10,29 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from elastic_client import create_user, delete_user, list_roles, list_users, test_connection
+from create_users_helpers import (
+    get_target_instances as resolve_target_instances,
+    init_default_users_state,
+    resolve_destination,
+)
+from elastic_client import create_user, delete_user, list_indices as es_list_indices, list_roles, list_users, search_index, test_connection
+from index_activity import (
+    BATCH_SIZE,
+    INDEX_PATTERN_SUFFIX,
+    MAX_UI_ROWS,
+    MAX_UUID_ROWS_TOTAL,
+    REQUEST_TIMEOUT,
+    UUID_PAGE_SIZE,
+    build_count_query,
+    build_period_range,
+    build_search_url,
+    build_uuid_query,
+    derive_search_pattern_from_index,
+    filter_operational_indices,
+    list_indices as index_list_indices,
+    parse_activity_count,
+    parse_uuid_hits,
+)
 from utils_io import (
     load_instances_from_csv,
     load_instances_from_json,
@@ -155,6 +178,13 @@ DEFAULT_SUPERUSERS = [
     {"username": "cpatino", "full_name": "Camilo Patino", "email": "cpatino@broadvoice.com", "roles": "superuser", "password": "Gocontact2021"},
 ]
 
+if "default_users_df" not in st.session_state:
+    default_df, default_selection = init_default_users_state(DEFAULT_SUPERUSERS)
+    st.session_state.default_users_df = default_df
+if "default_users_selection" not in st.session_state:
+    _, default_selection = init_default_users_state(DEFAULT_SUPERUSERS)
+    st.session_state.default_users_selection = default_selection
+
 
 if "instances" not in st.session_state:
     st.session_state.instances = []
@@ -180,6 +210,30 @@ if "auth_input_password" not in st.session_state:
     st.session_state.auth_input_password = st.session_state.auth.get("password", "")
 if "auth_input_api_key" not in st.session_state:
     st.session_state.auth_input_api_key = st.session_state.auth.get("api_key", "")
+if "index_report_rows" not in st.session_state:
+    st.session_state.index_report_rows = []
+if "index_report_errors" not in st.session_state:
+    st.session_state.index_report_errors = []
+if "authenticated_instances" not in st.session_state:
+    st.session_state.authenticated_instances = []
+if "auth_checked" not in st.session_state:
+    st.session_state.auth_checked = False
+if "cached_auth_headers" not in st.session_state:
+    st.session_state.cached_auth_headers = {}
+if "create_users_destination" not in st.session_state:
+    st.session_state.create_users_destination = "Todas"
+if "selected_instances" not in st.session_state:
+    st.session_state.selected_instances = []
+if "loaded_indices_df" not in st.session_state:
+    st.session_state.loaded_indices_df = pd.DataFrame()
+if "index_report_df" not in st.session_state:
+    st.session_state.index_report_df = pd.DataFrame()
+if "index_report_partial_df" not in st.session_state:
+    st.session_state.index_report_partial_df = pd.DataFrame()
+if "index_pattern" not in st.session_state:
+    st.session_state.index_pattern = "*_ivrs-*"
+if "include_system_indices" not in st.session_state:
+    st.session_state.include_system_indices = False
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -346,10 +400,33 @@ def build_auth_report_df() -> pd.DataFrame:
 
 def refresh_auth_report_df() -> None:
     st.session_state.auth_report_df = build_auth_report_df()
+    sync_authenticated_instances()
 
 
 def has_auth_report() -> bool:
     return not st.session_state.auth_report_df.empty
+
+
+def sync_authenticated_instances() -> None:
+    authenticated: List[Dict[str, str]] = []
+    for item in st.session_state.instances:
+        auth_state = st.session_state.instance_auth.get(item["base_url"], {})
+        if bool(auth_state.get("auth_ok", False)):
+            authenticated.append({"name": item["name"], "base_url": item["base_url"]})
+    st.session_state.authenticated_instances = authenticated
+
+
+def get_target_instances(destination: str) -> List[Dict[str, str]]:
+    authenticated = st.session_state.get("authenticated_instances", [])
+    return resolve_target_instances(destination, authenticated)
+
+
+def get_effective_auth_headers() -> Dict[str, str]:
+    headers = get_auth_headers()
+    if headers:
+        st.session_state.cached_auth_headers = headers
+        return headers
+    return st.session_state.get("cached_auth_headers", {})
 
 
 def get_operable_instances(all_instances: Dict[str, str]) -> Dict[str, str]:
@@ -402,6 +479,11 @@ def reset_auth_dependent_state() -> None:
     st.session_state.auth_logs = []
     st.session_state.users_data = {}
     st.session_state.roles_data = {}
+    st.session_state.create_roles_cache = {}
+    st.session_state.create_roles_cache_key = None
+    st.session_state.authenticated_instances = []
+    st.session_state.auth_checked = False
+    st.session_state.cached_auth_headers = {}
 
 
 def reset_delete_section_state() -> None:
@@ -501,6 +583,7 @@ with st.sidebar:
         elif not st.session_state.instances:
             st.warning("Agrega al menos una instancia.")
         else:
+            st.session_state.cached_auth_headers = headers
             total = len(st.session_state.instances)
             progress = st.progress(0)
             progress_text = st.empty()
@@ -534,6 +617,7 @@ with st.sidebar:
                 progress_text.caption(t("auth_verified_progress", done=index, total=total))
 
             refresh_auth_report_df()
+            st.session_state.auth_checked = True
             report_df = st.session_state.auth_report_df
             ok_count = int((report_df["auth_ok"] == True).sum()) if not report_df.empty else 0
             fail_count = int((report_df["auth_ok"] == False).sum()) if not report_df.empty else 0
@@ -569,6 +653,15 @@ with st.sidebar:
     show_logs = st.checkbox(t("show_logs"), value=False)
     if show_logs:
         with st.expander("Logs", expanded=True):
+            st.caption(f"debug.authenticated_instances_count={len(st.session_state.get('authenticated_instances', []))}")
+            st.caption(f"debug.create_users_destination={st.session_state.get('create_users_destination', 'Todas')}")
+            st.caption(
+                f"debug.target_instances_count={len(get_target_instances(st.session_state.get('create_users_destination', 'Todas')))}"
+            )
+            st.caption(
+                "debug.default_users_df="
+                + ("initialized" if not st.session_state.get("default_users_df", pd.DataFrame()).empty else "empty")
+            )
             st.dataframe(pd.DataFrame(st.session_state.auth_logs[-300:]), use_container_width=True)
 
     st.divider()
@@ -591,7 +684,7 @@ with st.sidebar:
         st.success(t("credentials_applied"))
 
 
-tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
+tab_users, tab_create, tab_roles, tab_index = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles"), "Index"])
 
 with tab_users:
     st.subheader(t("users_list_title"))
@@ -851,9 +944,13 @@ with tab_create:
     st.subheader("Crear usuarios")
     all_instances = instances_dict()
     operable_instances = get_operable_instances(all_instances)
+    authenticated_instances = st.session_state.get("authenticated_instances", [])
+    if not authenticated_instances and operable_instances:
+        authenticated_instances = [{"name": name, "base_url": url} for name, url in operable_instances.items()]
+        st.session_state.authenticated_instances = authenticated_instances
 
     if has_auth_report():
-        not_auth_count = len(all_instances) - len(operable_instances)
+        not_auth_count = len(all_instances) - len(authenticated_instances)
         if not_auth_count > 0:
             st.caption(f"{not_auth_count} instancias no autenticadas. Ver reporte para detalles.")
     else:
@@ -861,33 +958,58 @@ with tab_create:
 
     if not all_instances:
         st.info("No hay instancias configuradas.")
-    elif not operable_instances:
+    elif not authenticated_instances:
         st.warning("No hay instancias autenticadas para operar.")
     else:
-        target = st.selectbox("Instancia destino", ["Todas"] + list(operable_instances.keys()), key="create_instance")
-        headers = get_auth_headers()
+        authenticated_names = [item["name"] for item in authenticated_instances]
+        destination_options = ["Todas"] + authenticated_names
+        st.session_state.create_users_destination = resolve_destination(
+            st.session_state.get("create_users_destination", "Todas"),
+            authenticated_instances,
+        )
+        if st.session_state.create_users_destination == "Todas" and not authenticated_instances:
+            st.session_state.create_users_destination = destination_options[0]
+        target = st.selectbox("Instancia destino", destination_options, key="create_users_destination")
+        target_instances_data = get_target_instances(target)
+        target_instances = [(item["name"], item["base_url"]) for item in target_instances_data]
+        headers = get_effective_auth_headers()
 
         if not headers:
             st.warning("Completa autenticación para consultar roles y crear usuarios.")
         else:
-            target_instances = list(operable_instances.items()) if target == "Todas" else [(target, operable_instances[target])]
-
-            all_role_names = set()
-            role_errors = 0
-            for instance_name, instance_url in target_instances:
-                roles_resp = list_roles(instance_url, headers)
-                handle_auth_response(instance_name, instance_url, "list_roles", roles_resp)
-                if roles_resp.get("ok"):
-                    all_role_names.update(roles_resp.get("data", {}).keys())
-                else:
-                    role_errors += 1
+            roles_cache_key = {
+                "instances": tuple(target_instances),
+                "mode": st.session_state.auth.get("mode", ""),
+                "username": st.session_state.auth.get("username", ""),
+                "api_key": st.session_state.auth.get("api_key", ""),
+            }
+            should_load_roles = bool(target_instances) and target != "Todas"
+            if should_load_roles and st.session_state.get("create_roles_cache_key") != roles_cache_key:
+                all_role_names = set()
+                role_errors = 0
+                for instance_name, instance_url in target_instances:
+                    roles_resp = list_roles(instance_url, headers)
+                    handle_auth_response(instance_name, instance_url, "list_roles", roles_resp)
+                    if roles_resp.get("ok"):
+                        all_role_names.update(roles_resp.get("data", {}).keys())
+                    else:
+                        role_errors += 1
+                st.session_state.create_roles_cache_key = roles_cache_key
+                st.session_state.create_roles_cache = {"all_role_names": all_role_names, "role_errors": role_errors}
+            else:
+                cache_data = st.session_state.get("create_roles_cache", {"all_role_names": set(), "role_errors": 0})
+                all_role_names = set(cache_data.get("all_role_names", set())) if should_load_roles else set()
+                role_errors = int(cache_data.get("role_errors", 0)) if should_load_roles else 0
 
             if role_errors:
                 st.caption(f"Roles no disponibles en {role_errors} instancia(s).")
 
             available_roles = sorted(all_role_names)
             st.caption("Roles disponibles")
-            st.write(available_roles if available_roles else "No se pudieron cargar roles.")
+            if target == "Todas":
+                st.write("Selecciona una instancia específica para cargar roles en creación personalizada.")
+            else:
+                st.write(available_roles if available_roles else "No se pudieron cargar roles.")
 
             st.markdown("#### Crear un usuario")
             with st.form("single_create_form"):
@@ -962,32 +1084,44 @@ with tab_create:
                 )
 
                 apply_password = st.button("Aplicar a todos", key="apply_default_superuser_password")
-
-                if "default_superusers_table" not in st.session_state:
-                    st.session_state.default_superusers_table = [{**dict(row), "selected": False} for row in DEFAULT_SUPERUSERS]
+                if st.button("Reset default users selection", key="reset_default_users_selection"):
+                    reset_df = st.session_state.default_users_df.copy()
+                    if "selected" in reset_df.columns:
+                        reset_df["selected"] = True
+                    st.session_state.default_users_df = reset_df
+                    st.session_state.default_users_selection = (
+                        reset_df["username"].astype(str).tolist() if "username" in reset_df.columns else []
+                    )
 
                 if apply_password:
-                    st.session_state.default_superusers_table = [
-                        {**row, "password": default_password} for row in st.session_state.default_superusers_table
-                    ]
+                    df_pwd = st.session_state.default_users_df.copy()
+                    if "password" in df_pwd.columns:
+                        df_pwd["password"] = default_password
+                    st.session_state.default_users_df = df_pwd
 
-                default_users_df = pd.DataFrame(st.session_state.default_superusers_table)
                 edited_default_users_df = st.data_editor(
-                    default_users_df,
+                    st.session_state.default_users_df,
                     use_container_width=True,
                     num_rows="dynamic",
                     key="default_superusers_editor",
                 )
-                st.session_state.default_superusers_table = edited_default_users_df.to_dict("records")
+                st.session_state.default_users_df = edited_default_users_df.copy()
+                st.session_state.default_users_selection = (
+                    edited_default_users_df.loc[edited_default_users_df["selected"] == True, "username"].astype(str).tolist()
+                    if "selected" in edited_default_users_df.columns and "username" in edited_default_users_df.columns
+                    else []
+                )
 
                 selected_default_rows = [
-                    row for row in st.session_state.default_superusers_table if bool(row.get("selected", False))
+                    row
+                    for row in st.session_state.default_users_df.to_dict("records")
+                    if str(row.get("username", "")) in st.session_state.default_users_selection
                 ]
                 st.caption(
                     t(
                         "default_superusers_selected_summary",
                         selected=len(selected_default_rows),
-                        total=len(st.session_state.default_superusers_table),
+                        total=len(st.session_state.default_users_df),
                     )
                 )
 
@@ -996,7 +1130,8 @@ with tab_create:
                     value=False,
                 )
 
-                if st.button("Crear usuarios default", type="primary"):
+                can_create_default = bool(target_instances) and bool(selected_default_rows) and bool(confirm_default_superusers)
+                if st.button("Crear usuarios default", type="primary", disabled=not can_create_default):
                     if not confirm_default_superusers:
                         st.error("Debes confirmar antes de crear usuarios SUPERUSER.")
                     elif not selected_default_rows:
@@ -1159,3 +1294,257 @@ with tab_roles:
             st.dataframe(pd.DataFrame(role_rows), use_container_width=True)
         elif roles_resp:
             st.warning(f"No se pudieron listar roles ({short_message(roles_resp)}).")
+
+with tab_index:
+    st.subheader("Index")
+    all_instances = instances_dict()
+    operable_instances = get_operable_instances(all_instances)
+    headers = get_auth_headers()
+
+    if has_auth_report():
+        not_auth_count = len(all_instances) - len(operable_instances)
+        if not_auth_count > 0:
+            st.caption(f"{not_auth_count} instancias no autenticadas. Ver reporte para detalles.")
+    else:
+        st.caption("Sugerencia: ejecuta verificación de autenticación para filtrar instancias no autenticadas.")
+
+    if not all_instances:
+        st.info("No hay instancias configuradas.")
+    elif not operable_instances:
+        st.warning("No hay instancias autenticadas para operar.")
+    else:
+        select_all_instances = st.checkbox("Todas las instancias autenticadas", value=False, key="index_all_instances")
+        instance_options = list(operable_instances.keys())
+        if select_all_instances:
+            target_instance_names = instance_options
+        else:
+            selected_instance = st.selectbox(
+                "Instancia autenticada",
+                options=instance_options,
+                key="index_single_instance",
+            )
+            target_instance_names = [selected_instance] if selected_instance else []
+        st.session_state.selected_instances = target_instance_names
+        target_instances = [{"name": name, "base_url": operable_instances[name]} for name in target_instance_names]
+
+        period_options = ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 60 days", "Last 90 days", "Custom date range"]
+        selected_period = st.selectbox("Period", options=period_options, index=1, key="index_period")
+        custom_start = None
+        custom_end = None
+        if selected_period == "Custom date range":
+            c1, c2 = st.columns(2)
+            with c1:
+                custom_start = st.date_input("Start date", key="index_custom_start")
+            with c2:
+                custom_end = st.date_input("End date", key="index_custom_end")
+
+        include_uuids = st.checkbox("Include UUIDs in CSV", value=False, key="index_include_uuids")
+        st.caption("Including UUIDs can make the CSV larger.")
+
+        loaded_indices_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
+        if not loaded_indices_df.empty:
+            total_instances = int(loaded_indices_df["instance_name"].nunique()) if "instance_name" in loaded_indices_df.columns else 0
+            total_indices = len(loaded_indices_df)
+            st.caption(
+                f"Resumen: instancias={total_instances} | indices={total_indices} | patrón={st.session_state.index_pattern}"
+            )
+            preview_df = loaded_indices_df.head(500)
+            st.dataframe(preview_df, use_container_width=True)
+            if total_indices > 500:
+                st.caption("Showing first 500 rows")
+
+        if st.button("Run index activity report", type="primary", key="run_index_activity_report"):
+            if not headers:
+                st.warning("Completa autenticación.")
+            elif not target_instances:
+                st.warning("Selecciona al menos una instancia.")
+            else:
+                try:
+                    period_gte, period_lt = build_period_range(selected_period, custom_start, custom_end)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    st.stop()
+                period_label = selected_period
+                log_event(
+                    "index",
+                    "-",
+                    "index_report_config",
+                    None,
+                    "index_report_config",
+                    {"selected_instances": len(target_instances), "period": period_label, "index_pattern": INDEX_PATTERN_SUFFIX, "timeout": 60},
+                )
+                overall_progress = st.progress(0.0)
+                status_placeholder = st.empty()
+                report_rows: List[Dict[str, Any]] = []
+                report_errors: List[Dict[str, object]] = []
+                loaded_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
+                total_instances = len(target_instances)
+                active_count = 0
+                no_activity_count = 0
+                failed_count = 0
+                completed_count = 0
+                total_uuid_rows = 0
+                st.session_state.index_report_rows = []
+                st.session_state.index_report_partial_df = pd.DataFrame()
+
+                batches = [target_instances[i : i + BATCH_SIZE] for i in range(0, total_instances, BATCH_SIZE)]
+                total_batches = len(batches)
+                for batch_idx, batch in enumerate(batches, start=1):
+                    for instance in batch:
+                        started_at = datetime.utcnow()
+                        status_placeholder.caption(f"Batch {batch_idx}/{total_batches} - Checking {instance['name']}...")
+                        instance_loaded_df = loaded_df[loaded_df["base_url"] == instance["base_url"]] if not loaded_df.empty else pd.DataFrame()
+                        loaded_index_names = instance_loaded_df["index_name"].astype(str).tolist() if not instance_loaded_df.empty else []
+                        derived_patterns = [derive_search_pattern_from_index(index_name) for index_name in loaded_index_names]
+                        search_patterns = list(dict.fromkeys([p for p in derived_patterns if p])) or [INDEX_PATTERN_SUFFIX]
+
+                        for pattern in search_patterns:
+                            search_url = build_search_url(instance["base_url"], pattern)
+                            count_resp = search_index(instance["base_url"], headers, pattern, build_count_query(period_gte, period_lt, "timestamp"), timeout=REQUEST_TIMEOUT)
+                            if not count_resp.get("ok"):
+                                error_text = f"{count_resp.get('message', 'Request failed')} | url={search_url}"
+                                failed_count += 1
+                                report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": error_text})
+                                report_rows.append({
+                                    "report_date": datetime.utcnow().date().isoformat(),
+                                    "instance_name": instance["name"],
+                                    "base_url": instance["base_url"],
+                                    "index_pattern": pattern,
+                                    "period_label": period_label,
+                                    "activity_count": 0,
+                                    "has_activity": False,
+                                    "status": "failed",
+                                    "error": error_text,
+                                })
+                                continue
+
+                            activity_count = parse_activity_count(count_resp.get("data", {}))
+                            row_status = "active" if activity_count > 0 else "no_activity"
+                            if activity_count > 0:
+                                active_count += 1
+                            else:
+                                no_activity_count += 1
+
+                            if not include_uuids or activity_count <= 0:
+                                report_rows.append({
+                                    "report_date": datetime.utcnow().date().isoformat(),
+                                    "instance_name": instance["name"],
+                                    "base_url": instance["base_url"],
+                                    "index_pattern": pattern,
+                                    "period_label": period_label,
+                                    "activity_count": activity_count,
+                                    "has_activity": activity_count > 0,
+                                    "status": row_status,
+                                    "error": "",
+                                    "call_uuid": "",
+                                    "timestamp": "",
+                                    "uuid_export_limited": False,
+                                    "uuid_export_note": "",
+                                })
+                            else:
+                                offset = 0
+                                uuid_limited = False
+                                uuid_note = ""
+                                instance_uuid_rows: List[Dict[str, str]] = []
+                                while offset < activity_count and total_uuid_rows < MAX_UUID_ROWS_TOTAL:
+                                    remaining_global = MAX_UUID_ROWS_TOTAL - total_uuid_rows
+                                    page_size = min(UUID_PAGE_SIZE, remaining_global)
+                                    uuid_resp = search_index(
+                                        instance["base_url"],
+                                        headers,
+                                        pattern,
+                                        build_uuid_query(period_gte, period_lt, "timestamp", from_offset=offset, size=page_size),
+                                        timeout=REQUEST_TIMEOUT,
+                                    )
+                                    if not uuid_resp.get("ok"):
+                                        report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": str(uuid_resp.get("message", "UUID request failed"))})
+                                        break
+                                    parsed_page = parse_uuid_hits(uuid_resp.get("data", {}))
+                                    if not parsed_page:
+                                        break
+                                    instance_uuid_rows.extend(parsed_page)
+                                    total_uuid_rows += len(parsed_page)
+                                    offset += len(parsed_page)
+                                    if len(parsed_page) < page_size:
+                                        break
+                                if total_uuid_rows >= MAX_UUID_ROWS_TOTAL and activity_count > len(instance_uuid_rows):
+                                    uuid_limited = True
+                                    uuid_note = "UUID export reached safe limit. Count is complete, UUID list is partial."
+                                if not instance_uuid_rows:
+                                    report_rows.append({
+                                        "report_date": datetime.utcnow().date().isoformat(),
+                                        "instance_name": instance["name"],
+                                        "base_url": instance["base_url"],
+                                        "index_pattern": pattern,
+                                        "period_label": period_label,
+                                        "activity_count": activity_count,
+                                        "has_activity": activity_count > 0,
+                                        "status": row_status,
+                                        "error": "",
+                                        "call_uuid": "",
+                                        "timestamp": "",
+                                        "uuid_export_limited": uuid_limited,
+                                        "uuid_export_note": uuid_note,
+                                    })
+                                else:
+                                    for uuid_row in instance_uuid_rows:
+                                        report_rows.append({
+                                            "report_date": datetime.utcnow().date().isoformat(),
+                                            "instance_name": instance["name"],
+                                            "base_url": instance["base_url"],
+                                            "index_pattern": pattern,
+                                            "period_label": period_label,
+                                            "activity_count": activity_count,
+                                            "has_activity": activity_count > 0,
+                                            "status": row_status,
+                                            "error": "",
+                                            "call_uuid": uuid_row.get("call_uuid", ""),
+                                            "timestamp": uuid_row.get("timestamp", ""),
+                                            "uuid_export_limited": uuid_limited,
+                                            "uuid_export_note": uuid_note,
+                                        })
+                            del count_resp
+
+                        completed_count += 1
+                        elapsed_sec = (datetime.utcnow() - started_at).total_seconds()
+                        log_event(instance["name"], instance["base_url"], "index_report_instance_done", None, f"elapsed_sec={elapsed_sec:.2f}", "")
+                        overall_progress.progress(completed_count / total_instances if total_instances else 1.0)
+                        status_placeholder.caption(
+                            f"Completed {completed_count}/{total_instances} | Active: {active_count} | No activity: {no_activity_count} | Failed: {failed_count}"
+                        )
+
+                    st.session_state.index_report_rows.extend(report_rows[len(st.session_state.index_report_rows):])
+                    st.session_state.index_report_partial_df = pd.DataFrame(st.session_state.index_report_rows)
+                    gc.collect()
+
+                st.session_state.index_report_rows = report_rows
+                st.session_state.index_report_errors = report_errors
+                st.session_state.index_report_df = pd.DataFrame(report_rows)
+
+        if not st.session_state.get("index_report_df", pd.DataFrame()).empty:
+            index_report_df = st.session_state.index_report_df
+            st.dataframe(index_report_df.head(MAX_UI_ROWS), use_container_width=True)
+            if len(index_report_df) > MAX_UI_ROWS:
+                st.caption(f"Showing first {MAX_UI_ROWS} rows.")
+            csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                "Download CSV",
+                data=index_report_df.to_csv(index=False).encode("utf-8"),
+                file_name=csv_name,
+                mime="text/csv",
+                key="download_index_activity_csv",
+            )
+
+        if st.session_state.get("index_report_errors"):
+            with st.expander("Errors / logs", expanded=False):
+                st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
+        elif not st.session_state.get("index_report_partial_df", pd.DataFrame()).empty:
+            partial_df = st.session_state.index_report_partial_df
+            csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                "Download partial CSV",
+                data=partial_df.to_csv(index=False).encode("utf-8"),
+                file_name=csv_name,
+                mime="text/csv",
+                key="download_index_activity_partial_csv",
+            )
