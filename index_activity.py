@@ -26,6 +26,7 @@ REQUEST_TIMEOUT = 45
 MAX_UI_ROWS = 1000
 UUID_PAGE_SIZE = 1000
 MAX_UUID_ROWS_TOTAL = 50000
+MAX_UUID_ROWS_PER_CSV = 50000
 
 
 def to_es_datetime(value: datetime) -> str:

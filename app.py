@@ -19,14 +19,18 @@ from elastic_client import create_user, delete_user, list_roles, list_users, sea
 from index_activity import (
     BATCH_SIZE,
     INDEX_PATTERN_SUFFIX,
+    MAX_UUID_ROWS_PER_CSV,
     MAX_UI_ROWS,
     REQUEST_TIMEOUT,
+    UUID_PAGE_SIZE,
     build_count_query,
     build_period_range,
     build_search_url,
+    build_uuid_query,
     derive_search_pattern_from_index,
     filter_operational_indices,
     parse_activity_count,
+    parse_uuid_hits,
 )
 from utils_io import (
     load_instances_from_csv,
@@ -225,6 +229,8 @@ if "index_report_df" not in st.session_state:
     st.session_state.index_report_df = pd.DataFrame()
 if "index_report_partial_df" not in st.session_state:
     st.session_state.index_report_partial_df = pd.DataFrame()
+if "index_uuid_chunk_files" not in st.session_state:
+    st.session_state.index_uuid_chunk_files = []
 if "index_pattern" not in st.session_state:
     st.session_state.index_pattern = "*_ivrs-*"
 if "include_system_indices" not in st.session_state:
@@ -1334,13 +1340,14 @@ with tab_index:
                 custom_end = st.date_input("End date", key="index_custom_end")
 
         include_uuids = st.checkbox("Include UUIDs in CSV", value=False, key="index_include_uuids")
-        st.caption("UUID export is temporarily limited until count-only stability is validated for all instances.")
+        st.caption("UUID export uses chunked CSV files for stability on Streamlit Cloud.")
 
         if st.button("Reset report state", key="reset_index_report_state"):
             st.session_state.index_report_rows = []
             st.session_state.index_report_errors = []
             st.session_state.index_report_df = pd.DataFrame()
             st.session_state.index_report_partial_df = pd.DataFrame()
+            st.session_state.index_uuid_chunk_files = []
 
         loaded_indices_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
         if not loaded_indices_df.empty:
@@ -1386,6 +1393,10 @@ with tab_index:
                 completed_count = 0
                 st.session_state.index_report_rows = []
                 st.session_state.index_report_partial_df = pd.DataFrame()
+                st.session_state.index_uuid_chunk_files = []
+                uuid_chunk_rows: List[Dict[str, Any]] = []
+                uuid_chunk_number = 1
+                uuid_exported_total = 0
 
                 batches = [target_instances[i : i + BATCH_SIZE] for i in range(0, total_instances, BATCH_SIZE)]
                 total_batches = len(batches)
@@ -1406,12 +1417,17 @@ with tab_index:
                                 failed_count += 1
                                 report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": error_text})
                                 report_rows.append({
+                                    "report_date": datetime.utcnow().date().isoformat(),
                                     "instance_name": instance["name"],
                                     "base_url": instance["base_url"],
                                     "index_pattern": pattern,
+                                    "period_label": period_label,
                                     "activity_count": 0,
+                                    "has_activity": False,
                                     "status": "failed",
                                     "error": error_text,
+                                    "uuid_export_status": "failed",
+                                    "uuid_exported_count": 0,
                                 })
                                 continue
 
@@ -1423,13 +1439,82 @@ with tab_index:
                                 no_activity_count += 1
 
                             report_rows.append({
+                                "report_date": datetime.utcnow().date().isoformat(),
                                 "instance_name": instance["name"],
                                 "base_url": instance["base_url"],
                                 "index_pattern": pattern,
+                                "period_label": period_label,
                                 "activity_count": activity_count,
+                                "has_activity": activity_count > 0,
                                 "status": row_status,
-                                "error": "" if not include_uuids else "UUID export disabled for stability mode.",
+                                "error": "",
+                                "uuid_export_status": "not_requested" if not include_uuids else ("no_activity" if activity_count <= 0 else "completed"),
+                                "uuid_exported_count": 0,
                             })
+
+                            if include_uuids and activity_count > 0:
+                                offset = 0
+                                uuid_exported_for_pattern = 0
+                                uuid_status = "completed"
+                                uuid_error = ""
+                                while True:
+                                    uuid_resp = search_index(
+                                        instance["base_url"],
+                                        headers,
+                                        pattern,
+                                        build_uuid_query(period_gte, period_lt, "timestamp", from_offset=offset, size=UUID_PAGE_SIZE),
+                                        timeout=REQUEST_TIMEOUT,
+                                    )
+                                    if not uuid_resp.get("ok"):
+                                        message = str(uuid_resp.get("message", "UUID export failed"))
+                                        if "max_result_window" in message:
+                                            uuid_status = "partial_max_result_window"
+                                            uuid_error = "Elasticsearch max_result_window reached. Use search_after for full export."
+                                        else:
+                                            uuid_status = "failed"
+                                            uuid_error = message
+                                        break
+                                    uuid_page_rows = parse_uuid_hits(uuid_resp.get("data", {}))
+                                    page_num = (offset // UUID_PAGE_SIZE) + 1
+                                    status_placeholder.caption(
+                                        f"Batch {batch_idx}/{total_batches} - {instance['name']} | UUID page {page_num} | chunk {uuid_chunk_number} | UUID exported {uuid_exported_total}"
+                                    )
+                                    if not uuid_page_rows:
+                                        break
+                                    for uuid_row in uuid_page_rows:
+                                        uuid_chunk_rows.append(
+                                            {
+                                                "report_date": datetime.utcnow().date().isoformat(),
+                                                "instance_name": instance["name"],
+                                                "base_url": instance["base_url"],
+                                                "index_pattern": pattern,
+                                                "period_label": period_label,
+                                                "activity_count": activity_count,
+                                                "call_uuid": uuid_row.get("call_uuid", ""),
+                                                "timestamp": uuid_row.get("timestamp", ""),
+                                                "status": row_status,
+                                                "error": "",
+                                            }
+                                        )
+                                    uuid_exported_for_pattern += len(uuid_page_rows)
+                                    uuid_exported_total += len(uuid_page_rows)
+                                    offset += len(uuid_page_rows)
+                                    if len(uuid_chunk_rows) >= MAX_UUID_ROWS_PER_CSV:
+                                        chunk_df = pd.DataFrame(uuid_chunk_rows)
+                                        chunk_name = f"index_activity_uuids_part_{uuid_chunk_number}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+                                        st.session_state.index_uuid_chunk_files.append(
+                                            {"name": chunk_name, "data": chunk_df.to_csv(index=False).encode("utf-8")}
+                                        )
+                                        uuid_chunk_rows = []
+                                        uuid_chunk_number += 1
+                                    if len(uuid_page_rows) < UUID_PAGE_SIZE:
+                                        break
+
+                                report_rows[-1]["uuid_export_status"] = uuid_status
+                                report_rows[-1]["uuid_exported_count"] = uuid_exported_for_pattern
+                                if uuid_error:
+                                    report_rows[-1]["error"] = uuid_error
+
                             del count_resp
 
                         completed_count += 1
@@ -1447,15 +1532,19 @@ with tab_index:
                 st.session_state.index_report_rows = report_rows
                 st.session_state.index_report_errors = report_errors
                 st.session_state.index_report_df = pd.DataFrame(report_rows)
+                if uuid_chunk_rows:
+                    chunk_df = pd.DataFrame(uuid_chunk_rows)
+                    chunk_name = f"index_activity_uuids_part_{uuid_chunk_number}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+                    st.session_state.index_uuid_chunk_files.append({"name": chunk_name, "data": chunk_df.to_csv(index=False).encode("utf-8")})
 
         if not st.session_state.get("index_report_df", pd.DataFrame()).empty:
             index_report_df = st.session_state.index_report_df
             st.dataframe(index_report_df.head(MAX_UI_ROWS), use_container_width=True)
             if len(index_report_df) > MAX_UI_ROWS:
                 st.caption(f"Showing first {MAX_UI_ROWS} rows.")
-            csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+            csv_name = f"index_activity_summary_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
             st.download_button(
-                "Download CSV",
+                "Download summary CSV",
                 data=index_report_df.to_csv(index=False).encode("utf-8"),
                 file_name=csv_name,
                 mime="text/csv",
@@ -1464,14 +1553,24 @@ with tab_index:
 
         if not st.session_state.get("index_report_partial_df", pd.DataFrame()).empty:
             partial_df = st.session_state.index_report_partial_df
-            csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+            csv_name = f"index_activity_summary_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
             st.download_button(
-                "Download partial CSV",
+                "Download partial summary CSV",
                 data=partial_df.to_csv(index=False).encode("utf-8"),
                 file_name=csv_name,
                 mime="text/csv",
                 key="download_index_activity_partial_csv",
             )
+
+        if st.session_state.get("index_uuid_chunk_files"):
+            for idx, chunk_info in enumerate(st.session_state.index_uuid_chunk_files, start=1):
+                st.download_button(
+                    f"Download UUID CSV chunk {idx}",
+                    data=chunk_info["data"],
+                    file_name=chunk_info["name"],
+                    mime="text/csv",
+                    key=f"download_uuid_chunk_{idx}",
+                )
 
         if st.session_state.get("index_report_errors"):
             with st.expander("Errors / logs", expanded=False):
