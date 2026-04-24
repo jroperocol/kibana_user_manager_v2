@@ -16,11 +16,13 @@ from create_users_helpers import (
 )
 from elastic_client import create_user, delete_user, list_indices as es_list_indices, list_roles, list_users, search_index, test_connection
 from index_activity import (
+    build_activity_agg_query,
+    build_activity_rows_for_instance,
     build_date_range,
-    build_index_activity_report,
-    count_index_activity,
+    build_error_row,
     filter_indices,
     fetch_index_uuids,
+    parse_activity_buckets,
     list_indices as index_list_indices,
 )
 from utils_io import (
@@ -1329,11 +1331,23 @@ with tab_index:
                 custom_end = st.date_input("End date", key="index_custom_end")
 
         st.text_input("Index pattern", key="index_pattern")
+        st.caption("Use the same index pattern used in Kibana/Postman, for example 40506_broadvoice_collections_internal*.")
         st.checkbox("Include system indices", key="include_system_indices", value=st.session_state.include_system_indices)
         timestamp_field = st.text_input("Timestamp field", value="timestamp", key="index_timestamp_field")
+        report_mode = st.radio(
+            "Report mode",
+            options=["Fast activity check by pattern (recommended)", "Detailed check using loaded indices"],
+            index=0,
+            key="index_report_mode",
+        )
+        if report_mode == "Detailed check using loaded indices":
+            st.caption("Detailed mode can be slower because it evaluates loaded indices in more detail.")
         include_uuids = st.checkbox("Include UUIDs (slow)", value=False, key="index_include_uuids")
         st.caption("Including UUIDs can take longer if there are many records.")
         uuid_field = st.text_input("UUID field", value="uuid", key="index_uuid_field", disabled=not include_uuids)
+        request_timeout = st.number_input("Request timeout (seconds)", min_value=10, max_value=120, value=60, step=5, key="index_request_timeout")
+        max_workers = st.slider("Max workers", min_value=1, max_value=10, value=5, key="index_max_workers")
+        max_uuid_per_index = st.number_input("Max UUID per index", min_value=1000, max_value=50000, value=10000, step=1000, key="index_max_uuid_per_index")
 
         if st.button("Load indices", key="load_index_list"):
             if not headers:
@@ -1392,66 +1406,118 @@ with tab_index:
                 st.warning("Completa autenticación.")
             elif not target_instances:
                 st.warning("Selecciona al menos una instancia.")
-            elif st.session_state.get("loaded_indices_df", pd.DataFrame()).empty:
-                st.warning("Primero carga índices con 'Load indices'.")
+            elif report_mode == "Detailed check using loaded indices" and st.session_state.get("loaded_indices_df", pd.DataFrame()).empty:
+                st.warning("Detailed mode requiere índices cargados. Usa 'Load indices' primero.")
             else:
                 try:
                     period_label, start_dt, end_dt = build_date_range(selected_period, custom_start, custom_end)
                 except ValueError as exc:
                     st.error(str(exc))
                     st.stop()
+                log_event("index", "-", "index_report_config", None, "index_report_config", {
+                    "selected_instances": len(target_instances),
+                    "index_pattern": st.session_state.index_pattern,
+                    "period": period_label,
+                    "timeout": int(request_timeout),
+                    "max_workers": int(max_workers),
+                })
+                overall_progress = st.progress(0.0)
+                status_placeholder = st.empty()
+                report_rows: List[Dict[str, Any]] = []
+                report_errors: List[Dict[str, object]] = []
+                loaded_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
+                total_instances = len(target_instances)
 
-                runtime_indices_by_instance: Dict[str, List[Dict[str, Any]]] = {}
-                report_errors: List[Dict[str, object]] = list(st.session_state.get("index_report_errors", []))
-                loaded_df = st.session_state.loaded_indices_df
-                for instance in target_instances:
-                    instance_rows_df = loaded_df[loaded_df["base_url"] == instance["base_url"]]
-                    runtime_indices_by_instance[instance["base_url"]] = [
-                        {"index": row["index_name"]} for _, row in instance_rows_df.iterrows()
-                    ]
+                for instance_pos, instance in enumerate(target_instances, start=1):
+                    started_at = datetime.utcnow()
+                    status_placeholder.caption(f"Checking {instance['name']}...")
+                    agg_body = build_activity_agg_query(start_dt, end_dt, timestamp_field)
+                    agg_resp = search_index(
+                        instance["base_url"],
+                        headers,
+                        st.session_state.index_pattern,
+                        agg_body,
+                        timeout=int(request_timeout),
+                    )
+                    if not agg_resp.get("ok"):
+                        error_text = short_message(agg_resp)
+                        report_errors.append(
+                            {
+                                "instance_name": instance["name"],
+                                "base_url": instance["base_url"],
+                                "error": error_text,
+                            }
+                        )
+                        report_rows.append(build_error_row(instance, period_label, start_dt, end_dt, error_text))
+                        log_event(instance["name"], instance["base_url"], "index_report_error", agg_resp.get("status_code"), error_text, agg_resp.get("message", ""))
+                        overall_progress.progress(instance_pos / total_instances)
+                        status_placeholder.caption(f"Completed {instance['name']}")
+                        continue
 
-                total_indices = sum(len(items) for items in runtime_indices_by_instance.values())
-                progress = st.progress(0.0)
-                done_state = {"done": 0}
-
-                def _count_fn(instance: Dict[str, str], index_name: str) -> Dict[str, Any]:
-                    resp = count_index_activity(
+                    counts_by_index = parse_activity_buckets(agg_resp, include_system=st.session_state.include_system_indices)
+                    loaded_indices_for_instance: List[str] = []
+                    if report_mode == "Detailed check using loaded indices" and not loaded_df.empty:
+                        instance_loaded_df = loaded_df[loaded_df["base_url"] == instance["base_url"]]
+                        loaded_indices_for_instance = instance_loaded_df["index_name"].astype(str).tolist()
+                    instance_rows = build_activity_rows_for_instance(
                         instance,
-                        index_name,
+                        period_label,
                         start_dt,
                         end_dt,
-                        timestamp_field,
-                        headers,
-                        search_index,
-                    )
-                    done_state["done"] += 1
-                    progress.progress(done_state["done"] / total_indices if total_indices else 1.0)
-                    return resp
-
-                def _uuid_fn(instance: Dict[str, str], index_name: str) -> Dict[str, Any]:
-                    return fetch_index_uuids(
-                        instance,
-                        index_name,
-                        start_dt,
-                        end_dt,
-                        timestamp_field,
-                        uuid_field,
-                        headers,
-                        search_index,
+                        counts_by_index,
+                        loaded_indices_for_instance,
                     )
 
-                report_rows, builder_errors = build_index_activity_report(
-                    target_instances,
-                    runtime_indices_by_instance,
-                    period_label,
-                    start_dt,
-                    end_dt,
-                    include_uuids,
-                    _count_fn,
-                    _uuid_fn,
-                )
+                    if include_uuids:
+                        uuid_rows: List[Dict[str, Any]] = []
+                        for row in instance_rows:
+                            if int(row.get("activity_count", 0)) <= 0:
+                                uuid_rows.append({**row, "call_uuid": "", "uuid_limit_reached": False})
+                                continue
+                            uuid_resp = fetch_index_uuids(
+                                instance,
+                                row["index_name"],
+                                start_dt,
+                                end_dt,
+                                timestamp_field,
+                                uuid_field,
+                                headers,
+                                search_index,
+                                max_records=int(max_uuid_per_index),
+                                page_size=1000,
+                            )
+                            if not uuid_resp.get("ok"):
+                                uuid_rows.append({**row, "call_uuid": "", "uuid_limit_reached": False, "error": short_message(uuid_resp)})
+                                continue
+                            uuids = uuid_resp.get("uuids", [])
+                            if not uuids:
+                                uuid_rows.append({**row, "call_uuid": "", "uuid_limit_reached": bool(uuid_resp.get("uuid_limit_reached", False))})
+                            else:
+                                for uuid_value in uuids:
+                                    uuid_rows.append(
+                                        {
+                                            **row,
+                                            "call_uuid": uuid_value,
+                                            "uuid_limit_reached": bool(uuid_resp.get("uuid_limit_reached", False)),
+                                        }
+                                    )
+                        instance_rows = uuid_rows
+
+                    report_rows.extend(instance_rows)
+                    elapsed_sec = (datetime.utcnow() - started_at).total_seconds()
+                    log_event(
+                        instance["name"],
+                        instance["base_url"],
+                        "index_report_instance_done",
+                        agg_resp.get("status_code"),
+                        f"rows={len(instance_rows)}",
+                        f"elapsed_sec={elapsed_sec:.2f}",
+                    )
+                    overall_progress.progress(instance_pos / total_instances)
+                    status_placeholder.caption(f"Completed {instance['name']}")
+
                 st.session_state.index_report_rows = report_rows
-                st.session_state.index_report_errors = report_errors + builder_errors
+                st.session_state.index_report_errors = report_errors
                 st.session_state.index_report_df = pd.DataFrame(report_rows)
 
         if not st.session_state.get("index_report_df", pd.DataFrame()).empty:

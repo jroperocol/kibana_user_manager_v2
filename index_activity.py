@@ -119,6 +119,90 @@ def count_index_activity(
     }
 
 
+def build_activity_agg_query(start: datetime, end: datetime, timestamp_field: str) -> Dict[str, Any]:
+    return {
+        "size": 0,
+        "track_total_hits": True,
+        "query": {
+            "range": {
+                timestamp_field: {
+                    "gte": to_es_datetime(start),
+                    "lt": to_es_datetime(end),
+                }
+            }
+        },
+        "aggs": {
+            "by_index": {
+                "terms": {
+                    "field": "_index",
+                    "size": 10000,
+                }
+            }
+        },
+    }
+
+
+def parse_activity_buckets(response: Dict[str, Any], include_system: bool = False) -> Dict[str, int]:
+    buckets = response.get("data", {}).get("aggregations", {}).get("by_index", {}).get("buckets", [])
+    counts: Dict[str, int] = {}
+    for bucket in buckets:
+        index_name = str(bucket.get("key", ""))
+        if not index_name:
+            continue
+        if not include_system and is_system_index(index_name):
+            continue
+        counts[index_name] = int(bucket.get("doc_count", 0))
+    return counts
+
+
+def build_error_row(instance: Dict[str, str], period_label: str, start: datetime, end: datetime, error: str) -> Dict[str, Any]:
+    return {
+        "report_date": datetime.utcnow().date().isoformat(),
+        "instance_name": instance.get("name", ""),
+        "base_url": instance.get("base_url", ""),
+        "index_name": "",
+        "period_label": period_label,
+        "start_datetime": to_es_datetime(start),
+        "end_datetime": to_es_datetime(end),
+        "activity_count": 0,
+        "has_activity": False,
+        "error": error,
+    }
+
+
+def build_activity_rows_for_instance(
+    instance: Dict[str, str],
+    period_label: str,
+    start: datetime,
+    end: datetime,
+    counts_by_index: Dict[str, int],
+    loaded_indices: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    base = {
+        "report_date": datetime.utcnow().date().isoformat(),
+        "instance_name": instance.get("name", ""),
+        "base_url": instance.get("base_url", ""),
+        "period_label": period_label,
+        "start_datetime": to_es_datetime(start),
+        "end_datetime": to_es_datetime(end),
+    }
+
+    rows: List[Dict[str, Any]] = []
+    loaded_set = set(loaded_indices or [])
+    target_indices = sorted(set(counts_by_index.keys()) | loaded_set) if loaded_set else sorted(counts_by_index.keys())
+    for index_name in target_indices:
+        count_value = int(counts_by_index.get(index_name, 0))
+        rows.append(
+            {
+                **base,
+                "index_name": index_name,
+                "activity_count": count_value,
+                "has_activity": count_value > 0,
+            }
+        )
+    return rows
+
+
 def fetch_index_uuids(
     instance: Dict[str, str],
     index_name: str,
@@ -136,19 +220,19 @@ def fetch_index_uuids(
 
     while len(uuids) < max_records:
         body: Dict[str, Any] = {
-            "_source": [uuid_field, timestamp_field],
+            "_source": {"includes": [uuid_field, timestamp_field]},
             "size": min(page_size, max_records - len(uuids)),
             "query": {
                 "range": {
                     timestamp_field: {
                         "gte": to_es_datetime(start),
-                        "lte": to_es_datetime(end),
+                        "lt": to_es_datetime(end),
                     }
                 }
             },
             "sort": [
-                {timestamp_field: "desc"},
-                {"_id": "desc"},
+                {timestamp_field: "asc"},
+                {"_doc": "asc"},
             ],
         }
         if search_after:
@@ -178,7 +262,7 @@ def fetch_index_uuids(
         "ok": True,
         "status_code": 200,
         "uuids": uuids,
-        "truncated": len(uuids) >= max_records,
+        "uuid_limit_reached": len(uuids) >= max_records,
     }
 
 

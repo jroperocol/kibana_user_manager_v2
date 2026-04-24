@@ -3,11 +3,15 @@ import unittest
 
 from index_activity import (
     MAX_UUID_RECORDS,
+    build_activity_agg_query,
+    build_activity_rows_for_instance,
+    build_error_row,
     build_date_range,
     build_index_activity_report,
     fetch_index_uuids,
     filter_indices,
     list_indices,
+    parse_activity_buckets,
 )
 
 
@@ -201,6 +205,28 @@ class TestIndexFilteringAndPattern(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["uuids"]), MAX_UUID_RECORDS)
 
+    def test_uuid_limit_respected_with_custom_max(self):
+        def fake_search(_base_url, _headers, _index, body):
+            size = body["size"]
+            hits = [{"_source": {"uuid": f"u{i}"}, "sort": ["2026-04-01T00:00:00Z", i]} for i in range(size)]
+            return {"ok": True, "data": {"hits": {"hits": hits}}}
+
+        result = fetch_index_uuids(
+            {"name": "inst1", "base_url": "https://example"},
+            "ivr-index",
+            datetime(2026, 4, 1, 0, 0, 0),
+            datetime(2026, 4, 2, 0, 0, 0),
+            "timestamp",
+            "uuid",
+            {"Authorization": "x"},
+            fake_search,
+            max_records=1000,
+            page_size=1000,
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(result["uuids"]), 1000)
+        self.assertTrue(result["uuid_limit_reached"])
+
     def test_no_auto_execution_without_button_intent(self):
         calls = {"count": 0}
 
@@ -209,6 +235,62 @@ class TestIndexFilteringAndPattern(unittest.TestCase):
             return {"ok": True, "count": 1}
 
         self.assertEqual(calls["count"], 0)
+
+    def test_build_activity_agg_query(self):
+        body = build_activity_agg_query(datetime(2026, 4, 1, 0, 0, 0), datetime(2026, 4, 2, 0, 0, 0), "timestamp")
+        self.assertEqual(body["size"], 0)
+        self.assertTrue(body["track_total_hits"])
+        self.assertEqual(body["aggs"]["by_index"]["terms"]["field"], "_index")
+        self.assertEqual(body["aggs"]["by_index"]["terms"]["size"], 10000)
+        self.assertIn("lt", body["query"]["range"]["timestamp"])
+
+    def test_parse_buckets_and_zero_merge(self):
+        resp = {
+            "data": {
+                "aggregations": {
+                    "by_index": {
+                        "buckets": [
+                            {"key": "ivr-a", "doc_count": 5},
+                            {"key": ".kibana", "doc_count": 4},
+                        ]
+                    }
+                }
+            }
+        }
+        counts = parse_activity_buckets(resp, include_system=False)
+        self.assertEqual(counts, {"ivr-a": 5})
+
+        rows = build_activity_rows_for_instance(
+            {"name": "inst", "base_url": "https://e"},
+            "Last 24 hours",
+            datetime(2026, 4, 1, 0, 0, 0),
+            datetime(2026, 4, 2, 0, 0, 0),
+            counts,
+            loaded_indices=["ivr-a", "ivr-b"],
+        )
+        mapped = {row["index_name"]: row["activity_count"] for row in rows}
+        self.assertEqual(mapped["ivr-a"], 5)
+        self.assertEqual(mapped["ivr-b"], 0)
+
+    def test_timeout_error_row_behavior(self):
+        row = build_error_row(
+            {"name": "inst", "base_url": "https://e"},
+            "Last 24 hours",
+            datetime(2026, 4, 1, 0, 0, 0),
+            datetime(2026, 4, 2, 0, 0, 0),
+            "Request timed out",
+        )
+        self.assertEqual(row["activity_count"], 0)
+        self.assertFalse(row["has_activity"])
+        self.assertIn("timed out", row["error"])
+
+    def test_uuid_mode_only_for_positive_activity_indices(self):
+        rows = [
+            {"index_name": "a", "activity_count": 0},
+            {"index_name": "b", "activity_count": 2},
+        ]
+        to_fetch = [r["index_name"] for r in rows if int(r.get("activity_count", 0)) > 0]
+        self.assertEqual(to_fetch, ["b"])
 
 
 if __name__ == "__main__":

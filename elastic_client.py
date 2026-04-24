@@ -124,9 +124,15 @@ def list_indices(base_url: str, auth_headers: Dict[str, str], pattern: str = "*"
     return {"ok": True, "status_code": response.get("status_code"), "data": normalized}
 
 
-def search_index(base_url: str, auth_headers: Dict[str, str], index_name: str, body: Dict[str, Any]) -> Dict[str, Any]:
+def search_index(
+    base_url: str,
+    auth_headers: Dict[str, str],
+    index_name: str,
+    body: Dict[str, Any],
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Dict[str, Any]:
     """POST /{index}/_search"""
-    response = _request("POST", f"{base_url}/{index_name}/_search", auth_headers, json_body=body)
+    response = _request("POST", f"{base_url}/{index_name}/_search", auth_headers, json_body=body, timeout=timeout)
     if not response.get("ok"):
         return {
             "ok": False,
