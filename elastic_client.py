@@ -17,6 +17,7 @@ def _request(
     auth_headers: Dict[str, str],
     json_body: Dict[str, Any] | None = None,
     timeout: int = DEFAULT_TIMEOUT,
+    params: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     try:
         response = requests.request(
@@ -24,6 +25,7 @@ def _request(
             url=url,
             headers=auth_headers,
             json=json_body,
+            params=params,
             timeout=timeout,
         )
     except requests.exceptions.SSLError as exc:
@@ -87,6 +89,16 @@ def delete_user(base_url: str, auth_headers: Dict[str, str], username: str) -> D
 def list_roles(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
     """GET /_security/role"""
     return _request("GET", f"{base_url}/_security/role", auth_headers)
+
+
+def list_indices(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
+    """GET /_cat/indices?format=json"""
+    return _request("GET", f"{base_url}/_cat/indices", auth_headers, params={"format": "json"})
+
+
+def search_index(base_url: str, auth_headers: Dict[str, str], index_name: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """POST /{index}/_search"""
+    return _request("POST", f"{base_url}/{index_name}/_search", auth_headers, json_body=body)
 
 
 def test_connection(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
