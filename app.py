@@ -9,7 +9,14 @@ from typing import Any, Dict, List
 import pandas as pd
 import streamlit as st
 
-from elastic_client import create_user, delete_user, list_roles, list_users, test_connection
+from elastic_client import create_user, delete_user, list_indices as es_list_indices, list_roles, list_users, search_index, test_connection
+from index_activity import (
+    build_date_range,
+    build_index_activity_report,
+    count_index_activity,
+    fetch_index_uuids,
+    list_indices as index_list_indices,
+)
 from utils_io import (
     load_instances_from_csv,
     load_instances_from_json,
@@ -180,6 +187,10 @@ if "auth_input_password" not in st.session_state:
     st.session_state.auth_input_password = st.session_state.auth.get("password", "")
 if "auth_input_api_key" not in st.session_state:
     st.session_state.auth_input_api_key = st.session_state.auth.get("api_key", "")
+if "index_report_rows" not in st.session_state:
+    st.session_state.index_report_rows = []
+if "index_report_errors" not in st.session_state:
+    st.session_state.index_report_errors = []
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -591,7 +602,7 @@ with st.sidebar:
         st.success(t("credentials_applied"))
 
 
-tab_users, tab_create, tab_roles = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles")])
+tab_users, tab_create, tab_roles, tab_index = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles"), "Index"])
 
 with tab_users:
     st.subheader(t("users_list_title"))
@@ -1159,3 +1170,182 @@ with tab_roles:
             st.dataframe(pd.DataFrame(role_rows), use_container_width=True)
         elif roles_resp:
             st.warning(f"No se pudieron listar roles ({short_message(roles_resp)}).")
+
+with tab_index:
+    st.subheader("Index")
+    all_instances = instances_dict()
+    operable_instances = get_operable_instances(all_instances)
+    headers = get_auth_headers()
+
+    if has_auth_report():
+        not_auth_count = len(all_instances) - len(operable_instances)
+        if not_auth_count > 0:
+            st.caption(f"{not_auth_count} instancias no autenticadas. Ver reporte para detalles.")
+    else:
+        st.caption("Sugerencia: ejecuta verificación de autenticación para filtrar instancias no autenticadas.")
+
+    if not all_instances:
+        st.info("No hay instancias configuradas.")
+    elif not operable_instances:
+        st.warning("No hay instancias autenticadas para operar.")
+    else:
+        select_all_instances = st.checkbox("Todas las instancias autenticadas", value=True, key="index_all_instances")
+        instance_options = list(operable_instances.keys())
+        selected_instances = st.multiselect(
+            "Instancias autenticadas",
+            options=instance_options,
+            default=instance_options if select_all_instances else [],
+            disabled=select_all_instances,
+            key="index_selected_instances",
+        )
+        target_instance_names = instance_options if select_all_instances else selected_instances
+        target_instances = [{"name": name, "base_url": operable_instances[name]} for name in target_instance_names]
+
+        period_options = ["Today", "Last 24 hours", "Last 7 days", "Last 30 days", "Last 60 days", "Last 90 days", "Custom date range"]
+        selected_period = st.selectbox("Period", options=period_options, index=1, key="index_period")
+        custom_start = None
+        custom_end = None
+        if selected_period == "Custom date range":
+            c1, c2 = st.columns(2)
+            with c1:
+                custom_start = st.date_input("Start date", key="index_custom_start")
+            with c2:
+                custom_end = st.date_input("End date", key="index_custom_end")
+
+        timestamp_field = st.text_input("Timestamp field", value="timestamp", key="index_timestamp_field")
+        include_uuids = st.checkbox("Include call UUIDs in the report", value=False, key="index_include_uuids")
+        st.caption("Including UUIDs can take longer if there are many records.")
+        uuid_field = st.text_input("UUID field", value="uuid", key="index_uuid_field", disabled=not include_uuids)
+
+        indices_rows: List[Dict[str, object]] = []
+        list_errors: List[Dict[str, object]] = []
+        indices_by_instance: Dict[str, List[Dict[str, Any]]] = {}
+
+        if st.button("Load indices", key="load_index_list"):
+            if not headers:
+                st.warning("Completa autenticación.")
+            elif not target_instances:
+                st.warning("Selecciona al menos una instancia.")
+            else:
+                for instance in target_instances:
+                    index_resp = index_list_indices(instance, headers, es_list_indices)
+                    if index_resp.get("ok"):
+                        payload = index_resp.get("data", [])
+                        parsed_rows = payload if isinstance(payload, list) else []
+                        indices_by_instance[instance["base_url"]] = parsed_rows
+                        for item in parsed_rows:
+                            indices_rows.append(
+                                {
+                                    "instance_name": instance["name"],
+                                    "base_url": instance["base_url"],
+                                    "index_name": item.get("index", ""),
+                                    "health": item.get("health", ""),
+                                    "status": item.get("status", ""),
+                                    "docs_count": item.get("docs.count", ""),
+                                    "store_size": item.get("store.size", ""),
+                                }
+                            )
+                    else:
+                        list_errors.append(
+                            {
+                                "instance_name": instance["name"],
+                                "base_url": instance["base_url"],
+                                "index_name": "",
+                                "error": short_message(index_resp),
+                            }
+                        )
+                st.session_state.index_indices_rows = indices_rows
+                st.session_state.index_indices_by_instance = indices_by_instance
+                st.session_state.index_list_errors = list_errors
+
+        saved_index_rows = st.session_state.get("index_indices_rows", [])
+        if saved_index_rows:
+            st.dataframe(pd.DataFrame(saved_index_rows), use_container_width=True)
+
+        if st.button("Run index activity report", type="primary", key="run_index_activity_report"):
+            if not headers:
+                st.warning("Completa autenticación.")
+            elif not target_instances:
+                st.warning("Selecciona al menos una instancia.")
+            else:
+                try:
+                    period_label, start_dt, end_dt = build_date_range(selected_period, custom_start, custom_end)
+                except ValueError as exc:
+                    st.error(str(exc))
+                    st.stop()
+
+                runtime_indices_by_instance: Dict[str, List[Dict[str, Any]]] = {}
+                report_errors: List[Dict[str, object]] = []
+                for instance in target_instances:
+                    index_resp = index_list_indices(instance, headers, es_list_indices)
+                    if index_resp.get("ok"):
+                        payload = index_resp.get("data", [])
+                        runtime_indices_by_instance[instance["base_url"]] = payload if isinstance(payload, list) else []
+                    else:
+                        report_errors.append(
+                            {
+                                "instance_name": instance["name"],
+                                "base_url": instance["base_url"],
+                                "index_name": "",
+                                "error": short_message(index_resp),
+                            }
+                        )
+
+                total_indices = sum(len(items) for items in runtime_indices_by_instance.values())
+                progress = st.progress(0.0)
+                done_state = {"done": 0}
+
+                def _count_fn(instance: Dict[str, str], index_name: str) -> Dict[str, Any]:
+                    resp = count_index_activity(
+                        instance,
+                        index_name,
+                        start_dt,
+                        end_dt,
+                        timestamp_field,
+                        headers,
+                        search_index,
+                    )
+                    done_state["done"] += 1
+                    progress.progress(done_state["done"] / total_indices if total_indices else 1.0)
+                    return resp
+
+                def _uuid_fn(instance: Dict[str, str], index_name: str) -> Dict[str, Any]:
+                    return fetch_index_uuids(
+                        instance,
+                        index_name,
+                        start_dt,
+                        end_dt,
+                        timestamp_field,
+                        uuid_field,
+                        headers,
+                        search_index,
+                    )
+
+                report_rows, builder_errors = build_index_activity_report(
+                    target_instances,
+                    runtime_indices_by_instance,
+                    period_label,
+                    start_dt,
+                    end_dt,
+                    include_uuids,
+                    _count_fn,
+                    _uuid_fn,
+                )
+                st.session_state.index_report_rows = report_rows
+                st.session_state.index_report_errors = report_errors + builder_errors
+
+        if st.session_state.get("index_report_rows"):
+            index_report_df = pd.DataFrame(st.session_state.index_report_rows)
+            st.dataframe(index_report_df, use_container_width=True)
+            csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+            st.download_button(
+                "Download CSV",
+                data=index_report_df.to_csv(index=False).encode("utf-8"),
+                file_name=csv_name,
+                mime="text/csv",
+                key="download_index_activity_csv",
+            )
+
+        if st.session_state.get("index_report_errors"):
+            with st.expander("Errors / logs", expanded=False):
+                st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
