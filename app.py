@@ -15,23 +15,18 @@ from create_users_helpers import (
     init_default_users_state,
     resolve_destination,
 )
-from elastic_client import create_user, delete_user, list_indices as es_list_indices, list_roles, list_users, search_index, test_connection
+from elastic_client import create_user, delete_user, list_roles, list_users, search_index, test_connection
 from index_activity import (
     BATCH_SIZE,
     INDEX_PATTERN_SUFFIX,
     MAX_UI_ROWS,
-    MAX_UUID_ROWS_TOTAL,
     REQUEST_TIMEOUT,
-    UUID_PAGE_SIZE,
     build_count_query,
     build_period_range,
     build_search_url,
-    build_uuid_query,
     derive_search_pattern_from_index,
     filter_operational_indices,
-    list_indices as index_list_indices,
     parse_activity_count,
-    parse_uuid_hits,
 )
 from utils_io import (
     load_instances_from_csv,
@@ -1339,7 +1334,13 @@ with tab_index:
                 custom_end = st.date_input("End date", key="index_custom_end")
 
         include_uuids = st.checkbox("Include UUIDs in CSV", value=False, key="index_include_uuids")
-        st.caption("Including UUIDs can make the CSV larger.")
+        st.caption("UUID export is temporarily limited until count-only stability is validated for all instances.")
+
+        if st.button("Reset report state", key="reset_index_report_state"):
+            st.session_state.index_report_rows = []
+            st.session_state.index_report_errors = []
+            st.session_state.index_report_df = pd.DataFrame()
+            st.session_state.index_report_partial_df = pd.DataFrame()
 
         loaded_indices_df = st.session_state.get("loaded_indices_df", pd.DataFrame())
         if not loaded_indices_df.empty:
@@ -1383,7 +1384,6 @@ with tab_index:
                 no_activity_count = 0
                 failed_count = 0
                 completed_count = 0
-                total_uuid_rows = 0
                 st.session_state.index_report_rows = []
                 st.session_state.index_report_partial_df = pd.DataFrame()
 
@@ -1406,13 +1406,10 @@ with tab_index:
                                 failed_count += 1
                                 report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": error_text})
                                 report_rows.append({
-                                    "report_date": datetime.utcnow().date().isoformat(),
                                     "instance_name": instance["name"],
                                     "base_url": instance["base_url"],
                                     "index_pattern": pattern,
-                                    "period_label": period_label,
                                     "activity_count": 0,
-                                    "has_activity": False,
                                     "status": "failed",
                                     "error": error_text,
                                 })
@@ -1425,84 +1422,14 @@ with tab_index:
                             else:
                                 no_activity_count += 1
 
-                            if not include_uuids or activity_count <= 0:
-                                report_rows.append({
-                                    "report_date": datetime.utcnow().date().isoformat(),
-                                    "instance_name": instance["name"],
-                                    "base_url": instance["base_url"],
-                                    "index_pattern": pattern,
-                                    "period_label": period_label,
-                                    "activity_count": activity_count,
-                                    "has_activity": activity_count > 0,
-                                    "status": row_status,
-                                    "error": "",
-                                    "call_uuid": "",
-                                    "timestamp": "",
-                                    "uuid_export_limited": False,
-                                    "uuid_export_note": "",
-                                })
-                            else:
-                                offset = 0
-                                uuid_limited = False
-                                uuid_note = ""
-                                instance_uuid_rows: List[Dict[str, str]] = []
-                                while offset < activity_count and total_uuid_rows < MAX_UUID_ROWS_TOTAL:
-                                    remaining_global = MAX_UUID_ROWS_TOTAL - total_uuid_rows
-                                    page_size = min(UUID_PAGE_SIZE, remaining_global)
-                                    uuid_resp = search_index(
-                                        instance["base_url"],
-                                        headers,
-                                        pattern,
-                                        build_uuid_query(period_gte, period_lt, "timestamp", from_offset=offset, size=page_size),
-                                        timeout=REQUEST_TIMEOUT,
-                                    )
-                                    if not uuid_resp.get("ok"):
-                                        report_errors.append({"instance_name": instance["name"], "base_url": instance["base_url"], "error": str(uuid_resp.get("message", "UUID request failed"))})
-                                        break
-                                    parsed_page = parse_uuid_hits(uuid_resp.get("data", {}))
-                                    if not parsed_page:
-                                        break
-                                    instance_uuid_rows.extend(parsed_page)
-                                    total_uuid_rows += len(parsed_page)
-                                    offset += len(parsed_page)
-                                    if len(parsed_page) < page_size:
-                                        break
-                                if total_uuid_rows >= MAX_UUID_ROWS_TOTAL and activity_count > len(instance_uuid_rows):
-                                    uuid_limited = True
-                                    uuid_note = "UUID export reached safe limit. Count is complete, UUID list is partial."
-                                if not instance_uuid_rows:
-                                    report_rows.append({
-                                        "report_date": datetime.utcnow().date().isoformat(),
-                                        "instance_name": instance["name"],
-                                        "base_url": instance["base_url"],
-                                        "index_pattern": pattern,
-                                        "period_label": period_label,
-                                        "activity_count": activity_count,
-                                        "has_activity": activity_count > 0,
-                                        "status": row_status,
-                                        "error": "",
-                                        "call_uuid": "",
-                                        "timestamp": "",
-                                        "uuid_export_limited": uuid_limited,
-                                        "uuid_export_note": uuid_note,
-                                    })
-                                else:
-                                    for uuid_row in instance_uuid_rows:
-                                        report_rows.append({
-                                            "report_date": datetime.utcnow().date().isoformat(),
-                                            "instance_name": instance["name"],
-                                            "base_url": instance["base_url"],
-                                            "index_pattern": pattern,
-                                            "period_label": period_label,
-                                            "activity_count": activity_count,
-                                            "has_activity": activity_count > 0,
-                                            "status": row_status,
-                                            "error": "",
-                                            "call_uuid": uuid_row.get("call_uuid", ""),
-                                            "timestamp": uuid_row.get("timestamp", ""),
-                                            "uuid_export_limited": uuid_limited,
-                                            "uuid_export_note": uuid_note,
-                                        })
+                            report_rows.append({
+                                "instance_name": instance["name"],
+                                "base_url": instance["base_url"],
+                                "index_pattern": pattern,
+                                "activity_count": activity_count,
+                                "status": row_status,
+                                "error": "" if not include_uuids else "UUID export disabled for stability mode.",
+                            })
                             del count_resp
 
                         completed_count += 1
@@ -1535,10 +1462,7 @@ with tab_index:
                 key="download_index_activity_csv",
             )
 
-        if st.session_state.get("index_report_errors"):
-            with st.expander("Errors / logs", expanded=False):
-                st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
-        elif not st.session_state.get("index_report_partial_df", pd.DataFrame()).empty:
+        if not st.session_state.get("index_report_partial_df", pd.DataFrame()).empty:
             partial_df = st.session_state.index_report_partial_df
             csv_name = f"index_activity_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
             st.download_button(
@@ -1548,3 +1472,7 @@ with tab_index:
                 mime="text/csv",
                 key="download_index_activity_partial_csv",
             )
+
+        if st.session_state.get("index_report_errors"):
+            with st.expander("Errors / logs", expanded=False):
+                st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
