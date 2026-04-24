@@ -93,12 +93,46 @@ def list_roles(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
 
 def list_indices(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
     """GET /_cat/indices?format=json"""
-    return _request("GET", f"{base_url}/_cat/indices", auth_headers, params={"format": "json"})
+    response = _request("GET", f"{base_url}/_cat/indices", auth_headers, params={"format": "json"})
+    if not response.get("ok"):
+        return {
+            "ok": False,
+            "status_code": response.get("status_code"),
+            "message": f"Failed to list indices: {response.get('message', 'Unknown error')}",
+        }
+
+    payload = response.get("data", [])
+    if not isinstance(payload, list):
+        return {
+            "ok": False,
+            "status_code": response.get("status_code"),
+            "message": "Failed to list indices: invalid response payload",
+        }
+
+    normalized = [
+        {
+            "index": item.get("index", ""),
+            "health": item.get("health", ""),
+            "status": item.get("status", ""),
+            "docs.count": item.get("docs.count", ""),
+            "store.size": item.get("store.size", ""),
+        }
+        for item in payload
+        if isinstance(item, dict)
+    ]
+    return {"ok": True, "status_code": response.get("status_code"), "data": normalized}
 
 
 def search_index(base_url: str, auth_headers: Dict[str, str], index_name: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """POST /{index}/_search"""
-    return _request("POST", f"{base_url}/{index_name}/_search", auth_headers, json_body=body)
+    response = _request("POST", f"{base_url}/{index_name}/_search", auth_headers, json_body=body)
+    if not response.get("ok"):
+        return {
+            "ok": False,
+            "status_code": response.get("status_code"),
+            "message": f"Failed to search index '{index_name}': {response.get('message', 'Unknown error')}",
+        }
+    return response
 
 
 def test_connection(base_url: str, auth_headers: Dict[str, str]) -> Dict[str, Any]:
