@@ -1551,6 +1551,39 @@ with tab_index:
                 key="download_index_activity_csv",
             )
 
+            inactive_source_df = index_report_df.copy()
+            if {"instance_name", "base_url", "activity_count"}.issubset(inactive_source_df.columns):
+                grouped_activity = (
+                    inactive_source_df.groupby(["instance_name", "base_url"], as_index=False)["activity_count"].sum()
+                )
+                inactive_instances_df = grouped_activity[grouped_activity["activity_count"] == 0][
+                    ["instance_name", "base_url"]
+                ].copy()
+                if not inactive_instances_df.empty:
+                    inactive_instances_df["download_date"] = datetime.utcnow().date().isoformat()
+                    inactive_instances_df["status"] = "inactive"
+                    if "period_label" in inactive_source_df.columns:
+                        period_map = (
+                            inactive_source_df.groupby(["instance_name", "base_url"], as_index=False)["period_label"]
+                            .first()
+                            .rename(columns={"period_label": "period_label"})
+                        )
+                        inactive_instances_df = inactive_instances_df.merge(period_map, on=["instance_name", "base_url"], how="left")
+                    inactive_instances_df = inactive_instances_df[
+                        ["download_date", "instance_name", "base_url", "status"]
+                        + (["period_label"] if "period_label" in inactive_instances_df.columns else [])
+                    ]
+                    inactive_csv_name = f"inactive_instances_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
+                    st.download_button(
+                        "Download inactive instances report",
+                        data=inactive_instances_df.to_csv(index=False).encode("utf-8"),
+                        file_name=inactive_csv_name,
+                        mime="text/csv",
+                        key="download_inactive_instances_csv",
+                    )
+                else:
+                    st.caption("No inactive instances found for this period.")
+
         if not st.session_state.get("index_report_partial_df", pd.DataFrame()).empty:
             partial_df = st.session_state.index_report_partial_df
             csv_name = f"index_activity_summary_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv"
