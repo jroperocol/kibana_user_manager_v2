@@ -16,6 +16,21 @@ from create_users_helpers import (
     resolve_destination,
 )
 from elastic_client import create_user, delete_user, list_roles, list_users, search_index, test_connection
+from field_limit_audit import (
+    build_field_limit_excel,
+    build_instance_summary,
+    build_update_preview,
+    encoded_path,
+    extract_indices_from_cat,
+    extract_templates,
+    match_template,
+    merge_template_limit,
+    now_ts,
+    parse_total_fields_limit,
+    readonly_get,
+    safe_put_index_field_limit,
+    safe_put_template,
+)
 from index_activity import (
     BATCH_SIZE,
     INDEX_PATTERN_SUFFIX,
@@ -145,6 +160,44 @@ I18N = {
         "EN": "Download Excel report",
         "PT": "Download Excel report",
     },
+    "tab_field_limit": {"ES": "Límite de campos", "EN": "Field Limit Audit", "PT": "Limite de campos"},
+    "field_limit_description": {
+        "ES": "Este módulo revisa directamente los índices de Elasticsearch en las instancias autenticadas y muestra el valor de index.mapping.total_fields.limit.",
+        "EN": "This module directly checks Elasticsearch indices from authenticated instances and shows each index.mapping.total_fields.limit value.",
+        "PT": "Este módulo verifica diretamente os índices do Elasticsearch nas instâncias autenticadas e mostra cada valor de index.mapping.total_fields.limit.",
+    },
+    "field_limit_selector": {"ES": "Instancias autenticadas", "EN": "Authenticated instances", "PT": "Instâncias autenticadas"},
+    "field_limit_use_all_instances": {"ES": "Usar todas las instancias autenticadas", "EN": "Use all authenticated instances", "PT": "Usar todas as instâncias autenticadas"},
+    "field_limit_all_instances_caption": {"ES": "Se usarán {count} instancias autenticadas.", "EN": "{count} authenticated instances will be used.", "PT": "{count} instâncias autenticadas serão usadas."},
+    "field_limit_use_all_update_instances": {"ES": "Usar todas las instancias autenticadas para modificar", "EN": "Use all authenticated instances for update", "PT": "Usar todas as instâncias autenticadas para atualizar"},
+    "field_limit_include_hidden": {"ES": "Incluir índices del sistema / hidden indices", "EN": "Include system / hidden indices", "PT": "Incluir índices de sistema / hidden"},
+    "field_limit_templates": {"ES": "Revisar index templates si están disponibles", "EN": "Inspect index templates when available", "PT": "Revisar index templates se disponíveis"},
+    "field_limit_run": {"ES": "Ejecutar auditoría de límite de campos", "EN": "Run field limit audit", "PT": "Executar auditoria de limite de campos"},
+    "field_limit_export": {"ES": "Exportar reporte Excel", "EN": "Export Excel report", "PT": "Exportar relatório Excel"},
+    "metric_instances_checked": {"ES": "Instancias revisadas", "EN": "Instances checked", "PT": "Instâncias verificadas"},
+    "metric_workaround": {"ES": "Con workaround", "EN": "With workaround", "PT": "Com workaround"},
+    "metric_default": {"ES": "Solo default/missing", "EN": "Default/missing only", "PT": "Só default/ausente"},
+    "metric_errors": {"ES": "Con errores", "EN": "With errors", "PT": "Com erros"},
+    "metric_indices_above": {"ES": "Índices > 1000", "EN": "Indices > 1000", "PT": "Índices > 1000"},
+    "metric_indices_found": {"ES": "Índices encontrados", "EN": "Indices found", "PT": "Índices encontrados"},
+    "metric_indices_default": {"ES": "Índices con default 1000", "EN": "Indices with default 1000", "PT": "Índices com default 1000"},
+    "field_limit_select_instances": {"ES": "Seleccionar instancias", "EN": "Select instances", "PT": "Selecionar instâncias"},
+    "field_limit_increase_title": {"ES": "Aumentar límite de campos", "EN": "Increase field limit", "PT": "Aumentar limite de campos"},
+    "field_limit_new_limit": {"ES": "Nuevo límite", "EN": "New limit", "PT": "Novo limite"},
+    "field_limit_update_instances": {"ES": "Instancias a modificar", "EN": "Instances to update", "PT": "Instâncias para atualizar"},
+    "field_limit_apply_to": {"ES": "Aplicar a", "EN": "Apply to", "PT": "Aplicar a"},
+    "field_limit_apply_selected": {"ES": "Solo índices seleccionados en la tabla", "EN": "Only selected indices in the table", "PT": "Só índices selecionados na tabela"},
+    "field_limit_apply_default": {"ES": "Todos los índices con límite default 1000", "EN": "All indices with default limit 1000", "PT": "Todos os índices com limite default 1000"},
+    "field_limit_apply_lower": {"ES": "Todos los índices con límite menor al nuevo valor", "EN": "All indices with limit lower than the new value", "PT": "Todos os índices com limite menor que o novo valor"},
+    "field_limit_update_templates": {"ES": "Actualizar templates relacionados para futuros índices", "EN": "Update related templates for future indices", "PT": "Atualizar templates relacionados para índices futuros"},
+    "field_limit_dry_run": {"ES": "Solo simular, no aplicar cambios", "EN": "Dry run only, do not apply changes", "PT": "Só simular, não aplicar alterações"},
+    "field_limit_prepare": {"ES": "Preparar cambio", "EN": "Prepare update", "PT": "Preparar alteração"},
+    "field_limit_apply_confirmed": {"ES": "Aplicar cambio confirmado", "EN": "Apply confirmed update", "PT": "Aplicar alteração confirmada"},
+    "field_limit_confirm_text": {
+        "ES": "Esta acción modificará index.mapping.total_fields.limit en los índices seleccionados. Confirma que deseas continuar.",
+        "EN": "This action will modify index.mapping.total_fields.limit on the selected indices. Please confirm you want to continue.",
+        "PT": "Esta ação modificará index.mapping.total_fields.limit nos índices selecionados. Confirme que deseja continuar.",
+    },
 }
 
 
@@ -235,6 +288,22 @@ if "index_pattern" not in st.session_state:
     st.session_state.index_pattern = "*_ivrs-*"
 if "include_system_indices" not in st.session_state:
     st.session_state.include_system_indices = False
+if "field_limit_summary_rows" not in st.session_state:
+    st.session_state.field_limit_summary_rows = []
+if "field_limit_detail_rows" not in st.session_state:
+    st.session_state.field_limit_detail_rows = []
+if "field_limit_error_rows" not in st.session_state:
+    st.session_state.field_limit_error_rows = []
+if "field_limit_log_rows" not in st.session_state:
+    st.session_state.field_limit_log_rows = []
+if "field_limit_update_preview" not in st.session_state:
+    st.session_state.field_limit_update_preview = []
+if "field_limit_update_results" not in st.session_state:
+    st.session_state.field_limit_update_results = []
+if "field_limit_template_update_results" not in st.session_state:
+    st.session_state.field_limit_template_update_results = []
+if "field_limit_template_details" not in st.session_state:
+    st.session_state.field_limit_template_details = []
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -474,6 +543,264 @@ def build_logs_csv() -> bytes:
     return pd.DataFrame(st.session_state.auth_logs).to_csv(index=False).encode("utf-8")
 
 
+def add_field_limit_log(rows: List[Dict[str, Any]], instance: str, operation: str, endpoint: str, status: object, message: object) -> None:
+    rows.append(
+        {
+            "instance": instance,
+            "operation": operation,
+            "endpoint": endpoint,
+            "status": status,
+            "message": truncate_detail(message, 500),
+            "timestamp": now_ts(),
+        }
+    )
+
+
+def fetch_field_limit_templates(instance: Dict[str, str], headers: Dict[str, str], logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Best-effort template lookup for the Field Limits audit.
+
+    Template data enriches the report only; failures are logged as warnings and
+    never block the index-settings audit.
+    """
+    normalized: List[Dict[str, Any]] = []
+    resp = readonly_get(instance["base_url"], "/_index_template", headers)
+    add_field_limit_log(logs, instance["name"], "fetch_templates", resp.get("endpoint", "/_index_template"), resp.get("status_code"), short_message(resp))
+    if resp.get("ok"):
+        for template in extract_templates(resp.get("data", {})):
+            normalized.append(
+                {
+                    **template,
+                    "template_name": template.get("name", ""),
+                    "template_type": template.get("template_type", "composable"),
+                    "template_limit": template.get("limit") if template.get("limit") != "" else None,
+                    "raw": "",
+                }
+            )
+        return normalized
+
+    legacy = readonly_get(instance["base_url"], "/_template", headers)
+    add_field_limit_log(logs, instance["name"], "fetch_legacy_templates", legacy.get("endpoint", "/_template"), legacy.get("status_code"), short_message(legacy))
+    if legacy.get("ok"):
+        for template in extract_templates(legacy.get("data", {}), legacy=True):
+            normalized.append(
+                {
+                    **template,
+                    "template_name": template.get("name", ""),
+                    "template_type": template.get("template_type", "legacy"),
+                    "template_limit": template.get("limit") if template.get("limit") != "" else None,
+                    "raw": "",
+                }
+            )
+        return normalized
+
+    add_field_limit_log(
+        logs,
+        instance["name"],
+        "fetch_templates",
+        "/_index_template or /_template",
+        "warning",
+        legacy.get("message") or resp.get("message") or "Template inspection unavailable",
+    )
+    return []
+
+
+def list_field_limit_indices(instance: Dict[str, str], headers: Dict[str, str], include_hidden: bool, logs: List[Dict[str, Any]]) -> List[str]:
+    expand = "all" if include_hidden else "open"
+    params = {"format": "json", "h": "index", "expand_wildcards": expand}
+    resp = readonly_get(instance["base_url"], "/_cat/indices", headers, params=params)
+    add_field_limit_log(logs, instance["name"], "cat_indices", resp.get("endpoint", "/_cat/indices"), resp.get("status_code"), short_message(resp))
+    if not resp.get("ok"):
+        raise RuntimeError(str(resp.get("message") or "Unable to list indices"))
+    return extract_indices_from_cat(resp.get("data", []))
+
+
+def fetch_bulk_field_limits(instance: Dict[str, str], headers: Dict[str, str], include_hidden: bool, logs: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[str, Any]], bool]:
+    expand = "all" if include_hidden else "open"
+    resp = readonly_get(
+        instance["base_url"],
+        "/_settings",
+        headers,
+        params={"flat_settings": "true", "expand_wildcards": expand, "filter_path": "*.settings.index.mapping.total_fields.limit"},
+    )
+    add_field_limit_log(logs, instance["name"], "get_bulk_settings", resp.get("endpoint", "/_settings"), resp.get("status_code"), short_message(resp))
+    if not resp.get("ok") or not isinstance(resp.get("data"), dict):
+        return {}, False
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for index_name, payload in resp.get("data", {}).items():
+        parsed[str(index_name)] = parse_total_fields_limit({str(index_name): payload}, str(index_name))
+    return parsed, True
+
+
+def fetch_index_field_limit_direct(instance: Dict[str, str], headers: Dict[str, str], index_name: str, logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    encoded_index = encoded_path(index_name)
+    endpoint = f"/{encoded_index}/_settings"
+    resp = readonly_get(
+        instance["base_url"],
+        endpoint,
+        headers,
+        params={"flat_settings": "true", "filter_path": "*.settings.index.mapping.total_fields.limit"},
+    )
+    add_field_limit_log(logs, instance["name"], "get_index_settings_filtered", resp.get("endpoint", endpoint), resp.get("status_code"), short_message(resp))
+    if not resp.get("ok"):
+        resp = readonly_get(instance["base_url"], endpoint, headers, params={"flat_settings": "true"})
+        add_field_limit_log(logs, instance["name"], "get_index_settings", resp.get("endpoint", endpoint), resp.get("status_code"), short_message(resp))
+        if not resp.get("ok"):
+            return {"total_fields_limit": "", "default_assumed": False, "above_1000": False, "status": "error", "error_message": str(resp.get("message") or "settings request failed")}
+    return parse_total_fields_limit(resp.get("data", {}), index_name)
+
+
+def apply_field_limit_updates(preview_rows: List[Dict[str, Any]], headers: Dict[str, str]) -> List[Dict[str, Any]]:
+    results: List[Dict[str, Any]] = []
+    for row in preview_rows:
+        if not row.get("update_required"):
+            continue
+        if row.get("action") == "dry_run":
+            results.append(
+                {
+                    "instance": row.get("instance", ""),
+                    "index_name": row.get("index_name", ""),
+                    "previous_limit": row.get("current_limit", ""),
+                    "new_limit": row.get("new_limit", ""),
+                    "updated": False,
+                    "status_code": "",
+                    "status": "dry_run",
+                    "message": "Dry run only",
+                    "updated_at": now_ts(),
+                }
+            )
+            continue
+        resp = safe_put_index_field_limit(str(row.get("base_url", "")), str(row.get("index_name", "")), int(row.get("new_limit")), headers)
+        results.append(
+            {
+                "instance": row.get("instance", ""),
+                "index_name": row.get("index_name", ""),
+                "previous_limit": row.get("current_limit", ""),
+                "new_limit": row.get("new_limit", ""),
+                "updated": bool(resp.get("ok")),
+                "status_code": resp.get("status_code", ""),
+                "status": "updated" if resp.get("ok") else "error",
+                "message": short_message(resp),
+                "updated_at": now_ts(),
+            }
+        )
+    return results
+
+
+def apply_field_limit_template_updates(preview_rows: List[Dict[str, Any]], template_details: List[Dict[str, Any]], headers: Dict[str, str], dry_run: bool) -> List[Dict[str, Any]]:
+    details_by_key = {
+        (str(row.get("instance", "")), str(row.get("template_name", ""))): row
+        for row in template_details
+        if row.get("template_name") or row.get("name")
+    }
+    # Normalise older/newer key names from extract_templates.
+    details_by_key.update(
+        {
+            (str(row.get("instance", "")), str(row.get("name", ""))): row
+            for row in template_details
+            if row.get("name")
+        }
+    )
+    results: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in preview_rows:
+        template_name = str(row.get("template_name") or "")
+        if not row.get("update_required") or not template_name:
+            continue
+        key = (str(row.get("instance", "")), template_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        detail = details_by_key.get(key, {})
+        template_type = str(detail.get("template_type") or "")
+        previous_limit = detail.get("limit", "")
+        base_url = str(row.get("base_url", ""))
+        new_limit = int(row.get("new_limit"))
+        if template_type not in {"composable", "legacy"}:
+            results.append(
+                {
+                    "instance": row.get("instance", ""),
+                    "template_name": template_name,
+                    "template_type": template_type,
+                    "previous_limit": previous_limit,
+                    "new_limit": new_limit,
+                    "updated": False,
+                    "status_code": "",
+                    "status": "skipped_unclear_template_type",
+                    "message": "Template type was not confidently detected.",
+                    "updated_at": now_ts(),
+                }
+            )
+            continue
+        if dry_run:
+            results.append(
+                {
+                    "instance": row.get("instance", ""),
+                    "template_name": template_name,
+                    "template_type": template_type,
+                    "previous_limit": previous_limit,
+                    "new_limit": new_limit,
+                    "updated": False,
+                    "status_code": "",
+                    "status": "dry_run",
+                    "message": "Dry run only",
+                    "updated_at": now_ts(),
+                }
+            )
+            continue
+        endpoint = f"/_index_template/{encoded_path(template_name)}" if template_type == "composable" else f"/_template/{encoded_path(template_name)}"
+        get_resp = readonly_get(base_url, endpoint, headers)
+        if not get_resp.get("ok"):
+            results.append(
+                {
+                    "instance": row.get("instance", ""),
+                    "template_name": template_name,
+                    "template_type": template_type,
+                    "previous_limit": previous_limit,
+                    "new_limit": new_limit,
+                    "updated": False,
+                    "status_code": get_resp.get("status_code", ""),
+                    "status": "error",
+                    "message": short_message(get_resp),
+                    "updated_at": now_ts(),
+                }
+            )
+            continue
+        try:
+            body = merge_template_limit(get_resp.get("data", {}), template_type, new_limit)
+            put_resp = safe_put_template(base_url, template_name, template_type, body, headers)
+            updated = bool(put_resp.get("ok"))
+            results.append(
+                {
+                    "instance": row.get("instance", ""),
+                    "template_name": template_name,
+                    "template_type": template_type,
+                    "previous_limit": previous_limit,
+                    "new_limit": new_limit,
+                    "updated": updated,
+                    "status_code": put_resp.get("status_code", ""),
+                    "status": "updated" if updated else "error",
+                    "message": short_message(put_resp),
+                    "updated_at": now_ts(),
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "instance": row.get("instance", ""),
+                    "template_name": template_name,
+                    "template_type": template_type,
+                    "previous_limit": previous_limit,
+                    "new_limit": new_limit,
+                    "updated": False,
+                    "status_code": "",
+                    "status": "error",
+                    "message": truncate_detail(exc, 500),
+                    "updated_at": now_ts(),
+                }
+            )
+    return results
+
+
 def reset_auth_dependent_state() -> None:
     st.session_state.instance_auth = {}
     st.session_state.auth_report_df = pd.DataFrame()
@@ -485,6 +812,14 @@ def reset_auth_dependent_state() -> None:
     st.session_state.authenticated_instances = []
     st.session_state.auth_checked = False
     st.session_state.cached_auth_headers = {}
+    st.session_state.field_limit_summary_rows = []
+    st.session_state.field_limit_detail_rows = []
+    st.session_state.field_limit_error_rows = []
+    st.session_state.field_limit_log_rows = []
+    st.session_state.field_limit_update_preview = []
+    st.session_state.field_limit_update_results = []
+    st.session_state.field_limit_template_update_results = []
+    st.session_state.field_limit_template_details = []
 
 
 def reset_delete_section_state() -> None:
@@ -685,7 +1020,9 @@ with st.sidebar:
         st.success(t("credentials_applied"))
 
 
-tab_users, tab_create, tab_roles, tab_index = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles"), "Index"])
+tab_users, tab_create, tab_roles, tab_index, tab_field_limit = st.tabs(
+    [t("tab_users"), t("tab_create"), t("tab_roles"), "Index", t("tab_field_limit")]
+)
 
 with tab_users:
     st.subheader(t("users_list_title"))
@@ -1608,3 +1945,243 @@ with tab_index:
         if st.session_state.get("index_report_errors"):
             with st.expander("Errors / logs", expanded=False):
                 st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
+
+
+with tab_field_limit:
+    st.subheader(t("tab_field_limit"))
+    st.write(t("field_limit_description"))
+    authenticated_instances = st.session_state.get("authenticated_instances", [])
+    headers = get_effective_auth_headers()
+
+    if not authenticated_instances:
+        st.info("No hay instancias autenticadas para auditar." if st.session_state.get("lang", "ES") == "ES" else "No authenticated instances available for audit.")
+    else:
+        authenticated_instances = sorted(authenticated_instances, key=lambda item: str(item.get("name", "")).lower())
+        instance_labels = [f"{item['name']} ({item['base_url']})" for item in authenticated_instances]
+        label_to_instance = dict(zip(instance_labels, authenticated_instances))
+        use_all_audit_instances = st.checkbox(t("field_limit_use_all_instances"), value=True, key="field_limit_use_all_instances")
+        if use_all_audit_instances:
+            selected_labels = instance_labels
+            st.caption(t("field_limit_all_instances_caption", count=len(selected_labels)))
+        else:
+            selected_labels = st.multiselect(t("field_limit_select_instances"), options=instance_labels, default=[], key="field_limit_instances")
+        selected_instances = [label_to_instance[label] for label in selected_labels]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            include_hidden = st.checkbox(t("field_limit_include_hidden"), value=False, key="field_limit_include_hidden")
+        with c2:
+            inspect_templates = st.checkbox(t("field_limit_templates"), value=True, key="field_limit_templates")
+
+        if st.button(t("field_limit_run"), type="primary", key="run_field_limit_audit"):
+            if not headers:
+                st.warning("Completa autenticación." if st.session_state.get("lang", "ES") == "ES" else "Complete authentication.")
+            elif not selected_instances:
+                st.warning("Selecciona al menos una instancia." if st.session_state.get("lang", "ES") == "ES" else "Select at least one instance.")
+            else:
+                field_limit_rows: List[Dict[str, Any]] = []
+                summary_rows: List[Dict[str, Any]] = []
+                error_rows: List[Dict[str, Any]] = []
+                log_rows: List[Dict[str, Any]] = []
+                template_details: List[Dict[str, Any]] = []
+                progress = st.progress(0.0)
+                status_box = st.empty()
+                total = len(selected_instances)
+                for idx, instance in enumerate(selected_instances, start=1):
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — listing indices")
+                    instance_rows: List[Dict[str, Any]] = []
+                    try:
+                        indices = list_field_limit_indices(instance, headers, include_hidden, log_rows)
+                    except Exception as exc:
+                        message = truncate_detail(exc, 500)
+                        error_rows.append({"instance": instance["name"], "operation": "cat_indices", "endpoint": "/_cat/indices", "status": "error", "message": message, "timestamp": now_ts()})
+                        summary_rows.append(build_instance_summary(instance, [], fatal_error=message))
+                        progress.progress(idx / total)
+                        continue
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — fetching settings")
+                    bulk_settings, bulk_ok = fetch_bulk_field_limits(instance, headers, include_hidden, log_rows)
+                    templates = []
+                    if inspect_templates:
+                        status_box.caption(f"Checking {idx}/{total}: {instance['name']} — checking templates")
+                        try:
+                            templates = fetch_field_limit_templates(instance, headers, log_rows)
+                        except Exception as exc:
+                            add_field_limit_log(
+                                log_rows,
+                                instance.get("name", ""),
+                                "fetch_templates",
+                                "/_index_template or /_template",
+                                "warning",
+                                truncate_detail(exc, 500),
+                            )
+                            templates = []
+                    for template in templates:
+                        template_details.append({"instance": instance["name"], "base_url": instance["base_url"], **template})
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — building rows")
+                    for index_name in indices:
+                        if bulk_ok:
+                            parsed = bulk_settings.get(index_name) or parse_total_fields_limit({index_name: {"settings": {}}}, index_name)
+                        else:
+                            parsed = fetch_index_field_limit_direct(instance, headers, index_name, log_rows)
+                        template_name, template_limit = match_template(templates, "", index_name) if templates else ("", "")
+                        row = {
+                            "instance": instance["name"],
+                            "base_url": instance["base_url"],
+                            "index_name": index_name,
+                            "total_fields_limit": parsed.get("total_fields_limit", ""),
+                            "default_assumed": parsed.get("default_assumed", False),
+                            "above_1000": parsed.get("above_1000", False),
+                            "template_limit": template_limit,
+                            "template_name": template_name,
+                            "status": parsed.get("status", ""),
+                            "checked_at": now_ts(),
+                        }
+                        if parsed.get("status") == "error":
+                            row["error_message"] = parsed.get("error_message", "")
+                            error_rows.append({"instance": instance["name"], "operation": "index_settings", "endpoint": index_name, "status": "error", "message": row["error_message"], "timestamp": row["checked_at"]})
+                        instance_rows.append(row)
+                        field_limit_rows.append(row)
+                    summary_rows.append(build_instance_summary(instance, instance_rows))
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — completed")
+                    progress.progress(idx / total)
+
+                st.session_state.field_limit_detail_rows = field_limit_rows
+                st.session_state.field_limit_summary_rows = summary_rows
+                st.session_state.field_limit_error_rows = error_rows
+                st.session_state.field_limit_log_rows = log_rows
+                st.session_state.field_limit_template_details = template_details
+                st.session_state.field_limit_update_preview = []
+                st.session_state.field_limit_update_results = []
+                st.session_state.field_limit_template_update_results = []
+                status_box.caption("Field limit audit completed")
+
+        field_limit_rows = st.session_state.get("field_limit_detail_rows", [])
+        summary_rows = st.session_state.get("field_limit_summary_rows", [])
+        error_rows = st.session_state.get("field_limit_error_rows", [])
+        log_rows = st.session_state.get("field_limit_log_rows", [])
+        template_details = st.session_state.get("field_limit_template_details", [])
+        update_preview = st.session_state.get("field_limit_update_preview", [])
+        update_results = st.session_state.get("field_limit_update_results", [])
+        template_update_results = st.session_state.get("field_limit_template_update_results", [])
+
+        if field_limit_rows:
+            limits_df = pd.DataFrame(field_limit_rows)
+            summary_df = pd.DataFrame(summary_rows)
+            e1, e2, e3, e4, e5 = st.columns(5)
+            e1.metric(t("metric_instances_checked"), len(summary_rows))
+            e2.metric(t("metric_indices_found"), len(limits_df))
+            e3.metric(t("metric_indices_above"), int(limits_df["above_1000"].sum()))
+            e4.metric(t("metric_indices_default"), int(limits_df["default_assumed"].sum()))
+            e5.metric(t("metric_errors"), int((limits_df["status"] == "error").sum()) + len(error_rows))
+
+            display_df = limits_df.copy()
+            display_df.insert(0, "selected", False)
+            edited_df = st.data_editor(display_df, use_container_width=True, key="field_limit_table", disabled=[c for c in display_df.columns if c != "selected"])
+            selected_keys = set()
+            if isinstance(edited_df, pd.DataFrame) and "selected" in edited_df.columns:
+                selected_keys = set(
+                    (str(row["instance"]), str(row["index_name"]))
+                    for row in edited_df[edited_df["selected"] == True].to_dict("records")
+                )
+            st.session_state.field_limit_selected_keys = selected_keys
+
+            with st.expander("Instance summary", expanded=False):
+                st.dataframe(summary_df, use_container_width=True)
+            with st.expander("Errors / logs", expanded=False):
+                if error_rows:
+                    st.dataframe(pd.DataFrame(error_rows), use_container_width=True)
+                if log_rows:
+                    st.dataframe(pd.DataFrame(log_rows), use_container_width=True)
+            with st.expander("Template details", expanded=False):
+                if template_details:
+                    st.dataframe(pd.DataFrame(template_details), use_container_width=True)
+                else:
+                    st.caption("No template details available.")
+
+            st.divider()
+            st.subheader(t("field_limit_increase_title"))
+            u1, u2 = st.columns(2)
+            with u1:
+                new_limit = st.number_input(t("field_limit_new_limit"), min_value=1001, max_value=100000, value=2000, step=100, key="field_limit_new_limit")
+                update_template_flag = st.checkbox(t("field_limit_update_templates"), value=False, key="field_limit_update_templates")
+            with u2:
+                use_all_update_instances = st.checkbox(t("field_limit_use_all_update_instances"), value=True, key="field_limit_use_all_update_instances")
+                if use_all_update_instances:
+                    update_labels = instance_labels
+                    st.caption(t("field_limit_all_instances_caption", count=len(update_labels)))
+                else:
+                    update_labels = st.multiselect(t("field_limit_update_instances"), options=instance_labels, default=[], key="field_limit_update_instances")
+                dry_run = st.checkbox(t("field_limit_dry_run"), value=True, key="field_limit_dry_run")
+            mode_labels = {
+                t("field_limit_apply_selected"): "selected",
+                t("field_limit_apply_default"): "default",
+                t("field_limit_apply_lower"): "lower",
+            }
+            apply_mode_label = st.selectbox(t("field_limit_apply_to"), options=list(mode_labels.keys()), index=0, key="field_limit_apply_mode")
+            update_instance_names = [label_to_instance[label]["name"] for label in update_labels]
+
+            if st.button(t("field_limit_prepare"), key="field_limit_prepare_update"):
+                preview = build_update_preview(
+                    field_limit_rows,
+                    update_instance_names,
+                    st.session_state.get("field_limit_selected_keys", set()),
+                    mode_labels[apply_mode_label],
+                    int(new_limit),
+                    bool(update_template_flag),
+                    bool(dry_run),
+                )
+                st.session_state.field_limit_update_preview = preview
+                st.session_state.field_limit_update_results = apply_field_limit_updates(preview, headers) if dry_run else []
+                st.session_state.field_limit_template_update_results = (
+                    apply_field_limit_template_updates(preview, template_details, headers, True) if update_template_flag else []
+                )
+
+            update_preview = st.session_state.get("field_limit_update_preview", [])
+            if update_preview:
+                st.markdown("### Update preview")
+                preview_df = pd.DataFrame(update_preview)
+                st.dataframe(preview_df[["instance", "index_name", "current_limit", "new_limit", "default_assumed", "update_required", "template_name", "template_current_limit", "template_new_limit", "action", "status"]], use_container_width=True)
+                affected_instances = preview_df[preview_df["update_required"] == True]["instance"].nunique()
+                affected_indices = int((preview_df["update_required"] == True).sum())
+                st.warning(
+                    f"{t('field_limit_confirm_text')}\n\n"
+                    f"Instances affected: {affected_instances} | Indices affected: {affected_indices} | New limit: {int(new_limit)} | "
+                    f"Templates: {bool(update_template_flag)} | Dry run: {bool(dry_run)}"
+                )
+                confirm_ok = st.checkbox("I understand and want to continue", value=False, key="field_limit_confirm_checkbox")
+                confirm_text = st.text_input("Type CONFIRM", value="", key="field_limit_confirm_text_input")
+                if st.button(t("field_limit_apply_confirmed"), key="field_limit_apply_confirmed"):
+                    if not confirm_ok or confirm_text != "CONFIRM":
+                        st.error("Confirmation is required.")
+                    else:
+                        st.session_state.field_limit_update_results = apply_field_limit_updates(update_preview, headers)
+                        if update_template_flag:
+                            st.session_state.field_limit_template_update_results = apply_field_limit_template_updates(
+                                update_preview, template_details, headers, dry_run
+                            )
+                        st.success("Update process finished. Rerun the audit to verify current values.")
+
+            if st.session_state.get("field_limit_update_results"):
+                st.markdown("### Update results")
+                st.dataframe(pd.DataFrame(st.session_state.field_limit_update_results), use_container_width=True)
+            if st.session_state.get("field_limit_template_update_results"):
+                st.markdown("### Template update results")
+                st.dataframe(pd.DataFrame(st.session_state.field_limit_template_update_results), use_container_width=True)
+
+            file_name = f"field_limits_audit_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            st.download_button(
+                t("field_limit_export"),
+                data=build_field_limit_excel(
+                    field_limit_rows,
+                    summary_rows,
+                    error_rows,
+                    log_rows,
+                    st.session_state.get("field_limit_update_preview", []),
+                    st.session_state.get("field_limit_update_results", []),
+                    st.session_state.get("field_limit_template_update_results", []),
+                    template_details,
+                ),
+                file_name=file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_field_limit_audit_excel",
+            )
