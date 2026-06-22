@@ -23,6 +23,30 @@ SENSITIVE_PATTERNS = [
     re.compile(r"(token\s*[:=]\s*)([^,\s}]+)", re.IGNORECASE),
 ]
 
+__all__ = [
+    "DEFAULT_FIELD_LIMIT",
+    "FIELD_LIMIT_KEY",
+    "ReadOnlyRequestError",
+    "UnsafeWriteRequestError",
+    "build_field_limit_excel",
+    "build_instance_summary",
+    "build_update_preview",
+    "encoded_path",
+    "extract_data_views",
+    "extract_indices_from_cat",
+    "extract_indices_from_resolve",
+    "extract_templates",
+    "mask_sensitive",
+    "match_template",
+    "match_templates",
+    "merge_template_limit",
+    "now_ts",
+    "parse_total_fields_limit",
+    "readonly_get",
+    "safe_put_index_field_limit",
+    "safe_put_template",
+]
+
 
 class ReadOnlyRequestError(ValueError):
     pass

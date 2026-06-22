@@ -8,6 +8,27 @@ from field_limit_audit import (
 )
 
 
+def test_app_import_contract_names_exist():
+    import field_limit_audit
+
+    expected = [
+        "build_field_limit_excel",
+        "build_instance_summary",
+        "build_update_preview",
+        "encoded_path",
+        "extract_indices_from_cat",
+        "extract_templates",
+        "match_template",
+        "merge_template_limit",
+        "now_ts",
+        "parse_total_fields_limit",
+        "readonly_get",
+        "safe_put_index_field_limit",
+        "safe_put_template",
+    ]
+    assert [name for name in expected if not hasattr(field_limit_audit, name)] == []
+
+
 def test_parse_flat_total_fields_limit():
     result = parse_total_fields_limit({"idx": {"settings": {"index.mapping.total_fields.limit": "1000"}}}, "idx")
     assert result["total_fields_limit"] == 1000
