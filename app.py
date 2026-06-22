@@ -16,6 +16,18 @@ from create_users_helpers import (
     resolve_destination,
 )
 from elastic_client import create_user, delete_user, list_roles, list_users, search_index, test_connection
+from field_limit_audit import (
+    build_field_limit_excel,
+    build_instance_summary,
+    encoded_path,
+    extract_data_views,
+    extract_indices_from_resolve,
+    extract_templates,
+    match_template,
+    now_ts,
+    parse_total_fields_limit,
+    readonly_get,
+)
 from index_activity import (
     BATCH_SIZE,
     INDEX_PATTERN_SUFFIX,
@@ -145,6 +157,26 @@ I18N = {
         "EN": "Download Excel report",
         "PT": "Download Excel report",
     },
+    "tab_field_limit": {"ES": "Límite de campos", "EN": "Field Limit Audit", "PT": "Limite de campos"},
+    "field_limit_description": {
+        "ES": "Este módulo valida los index patterns / data views de las instancias autenticadas y revisa si los índices asociados tienen index.mapping.total_fields.limit superior a 1000.",
+        "EN": "This module validates index patterns / data views from authenticated instances and checks whether related indices have index.mapping.total_fields.limit greater than 1000.",
+        "PT": "Este módulo valida index patterns / data views das instâncias autenticadas e verifica se os índices associados têm index.mapping.total_fields.limit superior a 1000.",
+    },
+    "field_limit_selector": {"ES": "Instancias autenticadas", "EN": "Authenticated instances", "PT": "Instâncias autenticadas"},
+    "field_limit_include_hidden": {"ES": "Incluir índices del sistema / hidden indices", "EN": "Include system / hidden indices", "PT": "Incluir índices de sistema / hidden"},
+    "field_limit_max_indices": {"ES": "Máximo de índices por data view", "EN": "Maximum indices per data view", "PT": "Máximo de índices por data view"},
+    "field_limit_templates": {"ES": "Revisar index templates si están disponibles", "EN": "Inspect index templates when available", "PT": "Revisar index templates se disponíveis"},
+    "field_limit_verbose": {"ES": "Mostrar logs detallados", "EN": "Show detailed logs", "PT": "Mostrar logs detalhados"},
+    "field_limit_run": {"ES": "Ejecutar auditoría de límite de campos", "EN": "Run field limit audit", "PT": "Executar auditoria de limite de campos"},
+    "field_limit_export": {"ES": "Exportar reporte Excel", "EN": "Export Excel report", "PT": "Exportar relatório Excel"},
+    "metric_instances_checked": {"ES": "Instancias revisadas", "EN": "Instances checked", "PT": "Instâncias verificadas"},
+    "metric_workaround": {"ES": "Con workaround", "EN": "With workaround", "PT": "Com workaround"},
+    "metric_default": {"ES": "Solo default/missing", "EN": "Default/missing only", "PT": "Só default/ausente"},
+    "metric_errors": {"ES": "Con errores", "EN": "With errors", "PT": "Com erros"},
+    "metric_data_views": {"ES": "Data views revisados", "EN": "Data views checked", "PT": "Data views verificados"},
+    "metric_indices": {"ES": "Índices revisados", "EN": "Indices checked", "PT": "Índices verificados"},
+    "metric_indices_above": {"ES": "Índices > 1000", "EN": "Indices > 1000", "PT": "Índices > 1000"},
 }
 
 
@@ -235,6 +267,14 @@ if "index_pattern" not in st.session_state:
     st.session_state.index_pattern = "*_ivrs-*"
 if "include_system_indices" not in st.session_state:
     st.session_state.include_system_indices = False
+if "field_limit_summary_rows" not in st.session_state:
+    st.session_state.field_limit_summary_rows = []
+if "field_limit_detail_rows" not in st.session_state:
+    st.session_state.field_limit_detail_rows = []
+if "field_limit_error_rows" not in st.session_state:
+    st.session_state.field_limit_error_rows = []
+if "field_limit_log_rows" not in st.session_state:
+    st.session_state.field_limit_log_rows = []
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -474,6 +514,81 @@ def build_logs_csv() -> bytes:
     return pd.DataFrame(st.session_state.auth_logs).to_csv(index=False).encode("utf-8")
 
 
+def add_field_limit_log(rows: List[Dict[str, Any]], instance: str, operation: str, endpoint: str, status: object, message: object) -> None:
+    rows.append(
+        {
+            "instance": instance,
+            "operation": operation,
+            "endpoint": endpoint,
+            "status": status,
+            "message": truncate_detail(message, 500),
+            "timestamp": now_ts(),
+        }
+    )
+
+
+def fetch_field_limit_data_views(instance: Dict[str, str], headers: Dict[str, str], logs: List[Dict[str, Any]]) -> tuple[List[Dict[str, str]], str]:
+    resp = readonly_get(instance["base_url"], "/api/data_views", headers, extra_headers={"kbn-xsrf": "true"})
+    add_field_limit_log(logs, instance["name"], "get_data_views", resp.get("endpoint", "/api/data_views"), resp.get("status_code"), short_message(resp))
+    if resp.get("ok"):
+        views = extract_data_views(resp.get("data", {}))
+        if views:
+            return views, ""
+    fallback = readonly_get(instance["base_url"], "/api/saved_objects/_find", headers, params={"type": "index-pattern", "per_page": 10000}, extra_headers={"kbn-xsrf": "true"})
+    add_field_limit_log(logs, instance["name"], "get_saved_objects_index_patterns", fallback.get("endpoint", "/api/saved_objects/_find"), fallback.get("status_code"), short_message(fallback))
+    if fallback.get("ok"):
+        return extract_data_views(fallback.get("data", {}), legacy=True), ""
+    return [], str(fallback.get("message") or resp.get("message") or "Unable to retrieve data views")
+
+
+def fetch_field_limit_templates(instance: Dict[str, str], headers: Dict[str, str], logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    resp = readonly_get(instance["base_url"], "/_index_template", headers)
+    add_field_limit_log(logs, instance["name"], "get_index_templates", resp.get("endpoint", "/_index_template"), resp.get("status_code"), short_message(resp))
+    if resp.get("ok"):
+        return extract_templates(resp.get("data", {}))
+    fallback = readonly_get(instance["base_url"], "/_template", headers)
+    add_field_limit_log(logs, instance["name"], "get_legacy_templates", fallback.get("endpoint", "/_template"), fallback.get("status_code"), short_message(fallback))
+    if fallback.get("ok"):
+        return extract_templates(fallback.get("data", {}), legacy=True)
+    return []
+
+
+def resolve_field_limit_indices(instance: Dict[str, str], headers: Dict[str, str], index_pattern: str, include_hidden: bool, max_indices: int, logs: List[Dict[str, Any]]) -> List[str]:
+    encoded_pattern = encoded_path(index_pattern)
+    expand = "open,hidden" if include_hidden else "open"
+    resp = readonly_get(instance["base_url"], f"/_resolve/index/{encoded_pattern}", headers, params={"expand_wildcards": expand})
+    add_field_limit_log(logs, instance["name"], "resolve_indices", resp.get("endpoint", ""), resp.get("status_code"), short_message(resp))
+    indices = extract_indices_from_resolve(resp.get("data", {})) if resp.get("ok") else []
+    if not indices:
+        fallback = readonly_get(instance["base_url"], f"/_cat/indices/{encoded_pattern}", headers, params={"format": "json", "h": "index", "expand_wildcards": expand})
+        add_field_limit_log(logs, instance["name"], "cat_indices", fallback.get("endpoint", ""), fallback.get("status_code"), short_message(fallback))
+        if fallback.get("ok") and isinstance(fallback.get("data"), list):
+            indices = [str(item.get("index")) for item in fallback.get("data", []) if isinstance(item, dict) and item.get("index")]
+    if len(indices) > max_indices:
+        add_field_limit_log(logs, instance["name"], "truncate_indices", index_pattern, "warning", f"Matched {len(indices)} indices; truncated to {max_indices}")
+        indices = indices[:max_indices]
+    return indices
+
+
+def fetch_index_field_limit(instance: Dict[str, str], headers: Dict[str, str], index_name: str, logs: List[Dict[str, Any]]) -> Dict[str, Any]:
+    encoded_index = encoded_path(index_name)
+    endpoint = f"/{encoded_index}/_settings/index.mapping.total_fields.limit"
+    resp = readonly_get(instance["base_url"], endpoint, headers, params={"flat_settings": "true"})
+    add_field_limit_log(logs, instance["name"], "get_index_field_limit", resp.get("endpoint", endpoint), resp.get("status_code"), short_message(resp))
+    if not resp.get("ok"):
+        fallback = readonly_get(instance["base_url"], f"/{encoded_index}/_settings", headers, params={"flat_settings": "true"})
+        add_field_limit_log(logs, instance["name"], "get_index_settings", fallback.get("endpoint", ""), fallback.get("status_code"), short_message(fallback))
+        if not fallback.get("ok"):
+            return {"total_fields_limit": "", "default_assumed": False, "above_1000": False, "setting_source": "error", "status": "error", "error_message": str(fallback.get("message") or resp.get("message") or "settings request failed")}
+        resp = fallback
+        setting_source = "settings_fallback"
+    else:
+        setting_source = "settings"
+    parsed = parse_total_fields_limit(resp.get("data", {}), index_name)
+    parsed["setting_source"] = setting_source
+    return parsed
+
+
 def reset_auth_dependent_state() -> None:
     st.session_state.instance_auth = {}
     st.session_state.auth_report_df = pd.DataFrame()
@@ -485,6 +600,10 @@ def reset_auth_dependent_state() -> None:
     st.session_state.authenticated_instances = []
     st.session_state.auth_checked = False
     st.session_state.cached_auth_headers = {}
+    st.session_state.field_limit_summary_rows = []
+    st.session_state.field_limit_detail_rows = []
+    st.session_state.field_limit_error_rows = []
+    st.session_state.field_limit_log_rows = []
 
 
 def reset_delete_section_state() -> None:
@@ -685,7 +804,9 @@ with st.sidebar:
         st.success(t("credentials_applied"))
 
 
-tab_users, tab_create, tab_roles, tab_index = st.tabs([t("tab_users"), t("tab_create"), t("tab_roles"), "Index"])
+tab_users, tab_create, tab_roles, tab_index, tab_field_limit = st.tabs(
+    [t("tab_users"), t("tab_create"), t("tab_roles"), "Index", t("tab_field_limit")]
+)
 
 with tab_users:
     st.subheader(t("users_list_title"))
@@ -1608,3 +1729,129 @@ with tab_index:
         if st.session_state.get("index_report_errors"):
             with st.expander("Errors / logs", expanded=False):
                 st.dataframe(pd.DataFrame(st.session_state.index_report_errors), use_container_width=True)
+
+with tab_field_limit:
+    st.subheader(t("tab_field_limit"))
+    st.write(t("field_limit_description"))
+    authenticated_instances = st.session_state.get("authenticated_instances", [])
+    headers = get_effective_auth_headers()
+
+    if not authenticated_instances:
+        st.info("No hay instancias autenticadas para auditar." if st.session_state.get("lang", "ES") == "ES" else "No authenticated instances available for audit.")
+    else:
+        instance_labels = [f"{item['name']} ({item['base_url']})" for item in authenticated_instances]
+        label_to_instance = dict(zip(instance_labels, authenticated_instances))
+        selected_labels = st.multiselect(t("field_limit_selector"), options=instance_labels, default=instance_labels, key="field_limit_instances")
+        selected_instances = [label_to_instance[label] for label in selected_labels]
+
+        c1, c2 = st.columns(2)
+        with c1:
+            include_hidden = st.checkbox(t("field_limit_include_hidden"), value=False, key="field_limit_include_hidden")
+            inspect_templates = st.checkbox(t("field_limit_templates"), value=True, key="field_limit_templates")
+        with c2:
+            max_indices = st.number_input(t("field_limit_max_indices"), min_value=1, max_value=5000, value=200, step=50, key="field_limit_max_indices")
+            show_verbose_logs = st.checkbox(t("field_limit_verbose"), value=False, key="field_limit_verbose")
+
+        if st.button(t("field_limit_run"), type="primary", key="run_field_limit_audit"):
+            if not headers:
+                st.warning("Completa autenticación." if st.session_state.get("lang", "ES") == "ES" else "Complete authentication.")
+            elif not selected_instances:
+                st.warning("Selecciona al menos una instancia." if st.session_state.get("lang", "ES") == "ES" else "Select at least one instance.")
+            else:
+                summary_rows: List[Dict[str, Any]] = []
+                detail_rows: List[Dict[str, Any]] = []
+                error_rows: List[Dict[str, Any]] = []
+                log_rows: List[Dict[str, Any]] = []
+                progress = st.progress(0.0)
+                status_box = st.empty()
+                total = len(selected_instances)
+                for idx, instance in enumerate(selected_instances, start=1):
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']}")
+                    instance_detail_rows: List[Dict[str, Any]] = []
+                    data_views, data_view_error = fetch_field_limit_data_views(instance, headers, log_rows)
+                    if data_view_error:
+                        error_rows.append({"instance": instance["name"], "operation": "data_views", "endpoint": "/api/data_views", "status": "error", "message": data_view_error, "timestamp": now_ts()})
+                        summary_rows.append(build_instance_summary(instance, [], 0, data_view_error))
+                        progress.progress(idx / total)
+                        continue
+
+                    templates = fetch_field_limit_templates(instance, headers, log_rows) if inspect_templates else []
+                    settings_cache: Dict[str, Dict[str, Any]] = {}
+                    if not data_views:
+                        error_rows.append({"instance": instance["name"], "operation": "data_views", "endpoint": "/api/data_views", "status": "empty", "message": "No data views / index patterns found", "timestamp": now_ts()})
+
+                    for data_view in data_views:
+                        pattern = data_view.get("title", "")
+                        matched_indices = resolve_field_limit_indices(instance, headers, pattern, include_hidden, int(max_indices), log_rows)
+                        if not matched_indices:
+                            row = {
+                                "instance": instance["name"], "base_url": instance["base_url"], "data_view_id": data_view.get("id", ""),
+                                "data_view_title": data_view.get("title", ""), "index_pattern": pattern, "matched_index": "",
+                                "total_fields_limit": "", "default_assumed": False, "above_1000": False, "setting_source": "",
+                                "template_name": "", "template_limit": "", "status": "no_matched_indices", "error_message": "", "checked_at": now_ts(),
+                            }
+                            instance_detail_rows.append(row)
+                            detail_rows.append(row)
+                            continue
+                        for index_name in matched_indices:
+                            if index_name not in settings_cache:
+                                settings_cache[index_name] = fetch_index_field_limit(instance, headers, index_name, log_rows)
+                            parsed = settings_cache[index_name]
+                            template_name, template_limit = match_template(templates, pattern, index_name) if templates else ("", "")
+                            row = {
+                                "instance": instance["name"], "base_url": instance["base_url"], "data_view_id": data_view.get("id", ""),
+                                "data_view_title": data_view.get("title", ""), "index_pattern": pattern, "matched_index": index_name,
+                                "total_fields_limit": parsed.get("total_fields_limit", ""), "default_assumed": parsed.get("default_assumed", False),
+                                "above_1000": parsed.get("above_1000", False), "setting_source": parsed.get("setting_source", ""),
+                                "template_name": template_name, "template_limit": template_limit, "status": parsed.get("status", ""),
+                                "error_message": parsed.get("error_message", ""), "checked_at": now_ts(),
+                            }
+                            instance_detail_rows.append(row)
+                            detail_rows.append(row)
+                            if row["status"] == "error":
+                                error_rows.append({"instance": instance["name"], "operation": "index_settings", "endpoint": index_name, "status": "error", "message": row["error_message"], "timestamp": row["checked_at"]})
+                    summary_rows.append(build_instance_summary(instance, instance_detail_rows, len(data_views)))
+                    progress.progress(idx / total)
+
+                st.session_state.field_limit_summary_rows = summary_rows
+                st.session_state.field_limit_detail_rows = detail_rows
+                st.session_state.field_limit_error_rows = error_rows
+                st.session_state.field_limit_log_rows = log_rows
+                status_box.caption("Field limit audit completed")
+
+        summary_rows = st.session_state.get("field_limit_summary_rows", [])
+        detail_rows = st.session_state.get("field_limit_detail_rows", [])
+        error_rows = st.session_state.get("field_limit_error_rows", [])
+        log_rows = st.session_state.get("field_limit_log_rows", [])
+        if summary_rows:
+            summary_df = pd.DataFrame(summary_rows)
+            detail_df = pd.DataFrame(detail_rows)
+            error_df = pd.DataFrame(error_rows)
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric(t("metric_instances_checked"), len(summary_rows))
+            m2.metric(t("metric_workaround"), int(summary_df["workaround_detected"].sum()))
+            m3.metric(t("metric_default"), int((summary_df["status"] == "default_only").sum()))
+            m4.metric(t("metric_errors"), int(summary_df["status"].isin(["failed", "partial"]).sum()))
+            m5, m6, m7 = st.columns(3)
+            m5.metric(t("metric_data_views"), int(summary_df["data_views_checked"].sum()))
+            m6.metric(t("metric_indices"), int(summary_df["indices_checked"].sum()))
+            m7.metric(t("metric_indices_above"), int(summary_df["indices_above_1000"].sum()))
+
+            st.markdown("### Instance summary")
+            st.dataframe(summary_df, use_container_width=True)
+            st.markdown("### Details")
+            st.dataframe(detail_df, use_container_width=True)
+            if show_verbose_logs or error_rows:
+                st.markdown("### Errors / logs")
+                if error_rows:
+                    st.dataframe(error_df, use_container_width=True)
+                if show_verbose_logs and log_rows:
+                    st.dataframe(pd.DataFrame(log_rows), use_container_width=True)
+            file_name = f"field_limit_audit_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            st.download_button(
+                t("field_limit_export"),
+                data=build_field_limit_excel(summary_rows, detail_rows, error_rows, log_rows if show_verbose_logs else []),
+                file_name=file_name,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_field_limit_audit_excel",
+            )
