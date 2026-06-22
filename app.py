@@ -17,6 +17,7 @@ from create_users_helpers import (
 )
 from elastic_client import create_user, delete_user, list_roles, list_users, search_index, test_connection
 from field_limit_audit import (
+    DEFAULT_FIELD_LIMIT,
     build_field_limit_excel,
     build_instance_summary,
     build_update_preview,
@@ -823,6 +824,98 @@ def apply_field_limit_template_updates(preview_rows: List[Dict[str, Any]], templ
     return results
 
 
+
+EXPECTED_INSTANCE_COLUMNS = [
+    "selected",
+    "instance",
+    "base_url",
+    "current_effective_limit",
+    "explicit_limit_configured",
+    "detected_source",
+    "configured_indices_count",
+    "configured_templates_count",
+    "max_configured_index_limit",
+    "max_configured_template_limit",
+    "status",
+    "checked_at",
+    "error_message",
+]
+
+
+def _numeric_or_none(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_instance_limit_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(rows or [])
+    if df.empty:
+        return pd.DataFrame(columns=EXPECTED_INSTANCE_COLUMNS)
+
+    for col in EXPECTED_INSTANCE_COLUMNS:
+        if col not in df.columns:
+            if col == "selected":
+                df[col] = False
+            elif col == "current_effective_limit":
+                df[col] = DEFAULT_FIELD_LIMIT
+            elif col == "explicit_limit_configured":
+                df[col] = False
+            elif col in {"configured_indices_count", "configured_templates_count"}:
+                fallback = "indices_with_configured_limit" if col == "configured_indices_count" else None
+                df[col] = pd.to_numeric(df[fallback], errors="coerce").fillna(0).astype(int) if fallback and fallback in df.columns else 0
+            elif col in {"max_configured_index_limit", "max_configured_template_limit"}:
+                df[col] = df["max_detected_limit"] if col == "max_configured_index_limit" and "max_detected_limit" in df.columns else None
+            elif col == "status":
+                df[col] = "default_1000"
+            else:
+                df[col] = ""
+
+    df["selected"] = df["selected"].fillna(False).astype(bool)
+    df["configured_indices_count"] = pd.to_numeric(df["configured_indices_count"], errors="coerce").fillna(0).astype(int)
+    df["configured_templates_count"] = pd.to_numeric(df["configured_templates_count"], errors="coerce").fillna(0).astype(int)
+    df["explicit_limit_configured"] = (df["configured_indices_count"] > 0) | (df["configured_templates_count"] > 0)
+
+    for idx, row in df.iterrows():
+        if str(row.get("status", "")) == "error" or str(row.get("detected_source", "")) == "error":
+            df.at[idx, "detected_source"] = "error"
+            df.at[idx, "status"] = "error"
+            if not _numeric_or_none(row.get("current_effective_limit")):
+                df.at[idx, "current_effective_limit"] = ""
+            continue
+
+        index_limit = _numeric_or_none(row.get("max_configured_index_limit"))
+        template_limit = _numeric_or_none(row.get("max_configured_template_limit"))
+        explicit_limits = [value for value in [index_limit, template_limit] if value is not None]
+        has_index = int(row.get("configured_indices_count", 0)) > 0
+        has_template = int(row.get("configured_templates_count", 0)) > 0
+
+        if has_index and has_template:
+            df.at[idx, "detected_source"] = "index_settings_and_template"
+        elif has_index:
+            df.at[idx, "detected_source"] = "index_settings"
+        elif has_template:
+            df.at[idx, "detected_source"] = "template"
+        else:
+            df.at[idx, "detected_source"] = "default"
+
+        current_effective_limit = max(explicit_limits) if explicit_limits else DEFAULT_FIELD_LIMIT
+        df.at[idx, "current_effective_limit"] = current_effective_limit
+        if not explicit_limits:
+            df.at[idx, "status"] = "configured_1000_or_less" if has_index or has_template else "default_1000"
+        elif len(set(explicit_limits)) > 1:
+            df.at[idx, "status"] = "mixed_values"
+        elif current_effective_limit > DEFAULT_FIELD_LIMIT:
+            df.at[idx, "status"] = "configured_above_1000"
+        else:
+            df.at[idx, "status"] = "configured_1000_or_less"
+
+    df["error_message"] = df["error_message"].fillna("")
+    return df[EXPECTED_INSTANCE_COLUMNS]
+
 def build_instance_limit_row(instance: Dict[str, str], index_rows: List[Dict[str, Any]], template_rows: List[Dict[str, Any]], fatal_error: str = "") -> Dict[str, Any]:
     checked_at = now_ts()
     if fatal_error:
@@ -886,6 +979,7 @@ def build_instance_limit_row(instance: Dict[str, str], index_rows: List[Dict[str
         "max_configured_template_limit": max(template_limits) if template_limits else "",
         "status": status,
         "checked_at": checked_at,
+        "error_message": "",
     }
 
 
@@ -2182,18 +2276,17 @@ with tab_field_limit:
         template_update_results = st.session_state.get("field_limit_template_update_results", [])
 
         if summary_rows:
-            instance_df = pd.DataFrame(summary_rows)
+            instance_df = normalize_instance_limit_rows(summary_rows)
             technical_df = pd.DataFrame(field_limit_rows)
             e1, e2, e3, e4, e5 = st.columns(5)
             e1.metric(t("metric_instances_checked"), len(instance_df))
-            e2.metric(t("metric_instances_configured"), int(instance_df["explicit_limit_configured"].sum()))
+            e2.metric(t("metric_instances_configured"), int(instance_df["explicit_limit_configured"].fillna(False).sum()))
             e3.metric(t("metric_instances_default"), int((instance_df["detected_source"] == "default").sum()))
             numeric_limits = pd.to_numeric(instance_df["current_effective_limit"], errors="coerce")
             e4.metric(t("metric_highest_limit"), int(numeric_limits.max()) if not numeric_limits.dropna().empty else "")
             e5.metric(t("metric_errors"), int((instance_df["status"] == "error").sum()) + len(error_rows))
 
             display_df = instance_df.copy()
-            display_df.insert(0, "selected", False)
             main_columns = [
                 "selected",
                 "instance",
@@ -2207,6 +2300,7 @@ with tab_field_limit:
                 "max_configured_template_limit",
                 "status",
                 "checked_at",
+                "error_message",
             ]
             display_df = display_df[[col for col in main_columns if col in display_df.columns]]
             edited_df = st.data_editor(display_df, use_container_width=True, key="field_limit_instance_table", disabled=[c for c in display_df.columns if c != "selected"])
@@ -2300,7 +2394,7 @@ with tab_field_limit:
             st.download_button(
                 t("field_limit_export"),
                 data=build_field_limit_excel(
-                    summary_rows,
+                    normalize_instance_limit_rows(summary_rows).to_dict("records"),
                     field_limit_rows,
                     error_rows,
                     log_rows,
