@@ -13,7 +13,7 @@ import requests
 
 DEFAULT_FIELD_LIMIT = 1000
 FIELD_LIMIT_KEY = "index.mapping.total_fields.limit"
-REQUEST_TIMEOUT = 20
+REQUEST_TIMEOUT = (5, 30)
 SENSITIVE_PATTERNS = [
     re.compile(r"(Authorization\s*[:=]\s*)([^,\s}]+)", re.IGNORECASE),
     re.compile(r"(ApiKey\s+)([A-Za-z0-9+/=._-]+)", re.IGNORECASE),

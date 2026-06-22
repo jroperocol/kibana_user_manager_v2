@@ -181,7 +181,7 @@ I18N = {
     "metric_indices_above": {"ES": "Índices > 1000", "EN": "Indices > 1000", "PT": "Índices > 1000"},
     "metric_indices_found": {"ES": "Índices encontrados", "EN": "Indices found", "PT": "Índices encontrados"},
     "metric_indices_default": {"ES": "Índices con default 1000", "EN": "Indices with default 1000", "PT": "Índices com default 1000"},
-    "field_limit_index_filter": {"ES": "Filtro opcional de índice", "EN": "Optional index name filter", "PT": "Filtro opcional de índice"},
+    "field_limit_select_instances": {"ES": "Seleccionar instancias", "EN": "Select instances", "PT": "Selecionar instâncias"},
     "field_limit_increase_title": {"ES": "Aumentar límite de campos", "EN": "Increase field limit", "PT": "Aumentar limite de campos"},
     "field_limit_new_limit": {"ES": "Nuevo límite", "EN": "New limit", "PT": "Novo limite"},
     "field_limit_update_instances": {"ES": "Instancias a modificar", "EN": "Instances to update", "PT": "Instâncias para atualizar"},
@@ -604,18 +604,31 @@ def fetch_field_limit_templates(instance: Dict[str, str], headers: Dict[str, str
     return []
 
 
-def list_field_limit_indices(instance: Dict[str, str], headers: Dict[str, str], include_hidden: bool, index_filter: str, logs: List[Dict[str, Any]]) -> List[str]:
+def list_field_limit_indices(instance: Dict[str, str], headers: Dict[str, str], include_hidden: bool, logs: List[Dict[str, Any]]) -> List[str]:
     expand = "all" if include_hidden else "open"
     params = {"format": "json", "h": "index", "expand_wildcards": expand}
     resp = readonly_get(instance["base_url"], "/_cat/indices", headers, params=params)
     add_field_limit_log(logs, instance["name"], "cat_indices", resp.get("endpoint", "/_cat/indices"), resp.get("status_code"), short_message(resp))
     if not resp.get("ok"):
         raise RuntimeError(str(resp.get("message") or "Unable to list indices"))
-    indices = extract_indices_from_cat(resp.get("data", []))
-    filter_text = (index_filter or "").strip()
-    if filter_text:
-        indices = [name for name in indices if filter_text in name]
-    return indices
+    return extract_indices_from_cat(resp.get("data", []))
+
+
+def fetch_bulk_field_limits(instance: Dict[str, str], headers: Dict[str, str], include_hidden: bool, logs: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[str, Any]], bool]:
+    expand = "all" if include_hidden else "open"
+    resp = readonly_get(
+        instance["base_url"],
+        "/_settings",
+        headers,
+        params={"flat_settings": "true", "expand_wildcards": expand, "filter_path": "*.settings.index.mapping.total_fields.limit"},
+    )
+    add_field_limit_log(logs, instance["name"], "get_bulk_settings", resp.get("endpoint", "/_settings"), resp.get("status_code"), short_message(resp))
+    if not resp.get("ok") or not isinstance(resp.get("data"), dict):
+        return {}, False
+    parsed: Dict[str, Dict[str, Any]] = {}
+    for index_name, payload in resp.get("data", {}).items():
+        parsed[str(index_name)] = parse_total_fields_limit({str(index_name): payload}, str(index_name))
+    return parsed, True
 
 
 def fetch_index_field_limit_direct(instance: Dict[str, str], headers: Dict[str, str], index_name: str, logs: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1943,6 +1956,7 @@ with tab_field_limit:
     if not authenticated_instances:
         st.info("No hay instancias autenticadas para auditar." if st.session_state.get("lang", "ES") == "ES" else "No authenticated instances available for audit.")
     else:
+        authenticated_instances = sorted(authenticated_instances, key=lambda item: str(item.get("name", "")).lower())
         instance_labels = [f"{item['name']} ({item['base_url']})" for item in authenticated_instances]
         label_to_instance = dict(zip(instance_labels, authenticated_instances))
         use_all_audit_instances = st.checkbox(t("field_limit_use_all_instances"), value=True, key="field_limit_use_all_instances")
@@ -1950,16 +1964,14 @@ with tab_field_limit:
             selected_labels = instance_labels
             st.caption(t("field_limit_all_instances_caption", count=len(selected_labels)))
         else:
-            selected_labels = st.multiselect(t("field_limit_selector"), options=instance_labels, default=[], key="field_limit_instances")
+            selected_labels = st.multiselect(t("field_limit_select_instances"), options=instance_labels, default=[], key="field_limit_instances")
         selected_instances = [label_to_instance[label] for label in selected_labels]
 
-        c1, c2, c3 = st.columns(3)
+        c1, c2 = st.columns(2)
         with c1:
             include_hidden = st.checkbox(t("field_limit_include_hidden"), value=False, key="field_limit_include_hidden")
         with c2:
             inspect_templates = st.checkbox(t("field_limit_templates"), value=True, key="field_limit_templates")
-        with c3:
-            index_filter = st.text_input(t("field_limit_index_filter"), value="", key="field_limit_index_filter")
 
         if st.button(t("field_limit_run"), type="primary", key="run_field_limit_audit"):
             if not headers:
@@ -1976,10 +1988,21 @@ with tab_field_limit:
                 status_box = st.empty()
                 total = len(selected_instances)
                 for idx, instance in enumerate(selected_instances, start=1):
-                    status_box.caption(f"Checking {idx}/{total}: {instance['name']}")
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — listing indices")
                     instance_rows: List[Dict[str, Any]] = []
+                    try:
+                        indices = list_field_limit_indices(instance, headers, include_hidden, log_rows)
+                    except Exception as exc:
+                        message = truncate_detail(exc, 500)
+                        error_rows.append({"instance": instance["name"], "operation": "cat_indices", "endpoint": "/_cat/indices", "status": "error", "message": message, "timestamp": now_ts()})
+                        summary_rows.append(build_instance_summary(instance, [], fatal_error=message))
+                        progress.progress(idx / total)
+                        continue
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — fetching settings")
+                    bulk_settings, bulk_ok = fetch_bulk_field_limits(instance, headers, include_hidden, log_rows)
                     templates = []
                     if inspect_templates:
+                        status_box.caption(f"Checking {idx}/{total}: {instance['name']} — checking templates")
                         try:
                             templates = fetch_field_limit_templates(instance, headers, log_rows)
                         except Exception as exc:
@@ -1994,16 +2017,12 @@ with tab_field_limit:
                             templates = []
                     for template in templates:
                         template_details.append({"instance": instance["name"], "base_url": instance["base_url"], **template})
-                    try:
-                        indices = list_field_limit_indices(instance, headers, include_hidden, index_filter, log_rows)
-                    except Exception as exc:
-                        message = truncate_detail(exc, 500)
-                        error_rows.append({"instance": instance["name"], "operation": "cat_indices", "endpoint": "/_cat/indices", "status": "error", "message": message, "timestamp": now_ts()})
-                        summary_rows.append(build_instance_summary(instance, [], fatal_error=message))
-                        progress.progress(idx / total)
-                        continue
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — building rows")
                     for index_name in indices:
-                        parsed = fetch_index_field_limit_direct(instance, headers, index_name, log_rows)
+                        if bulk_ok:
+                            parsed = bulk_settings.get(index_name) or parse_total_fields_limit({index_name: {"settings": {}}}, index_name)
+                        else:
+                            parsed = fetch_index_field_limit_direct(instance, headers, index_name, log_rows)
                         template_name, template_limit = match_template(templates, "", index_name) if templates else ("", "")
                         row = {
                             "instance": instance["name"],
@@ -2023,6 +2042,7 @@ with tab_field_limit:
                         instance_rows.append(row)
                         field_limit_rows.append(row)
                     summary_rows.append(build_instance_summary(instance, instance_rows))
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — completed")
                     progress.progress(idx / total)
 
                 st.session_state.field_limit_detail_rows = field_limit_rows
