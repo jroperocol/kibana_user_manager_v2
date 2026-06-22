@@ -167,6 +167,9 @@ I18N = {
         "PT": "Este módulo verifica diretamente os índices do Elasticsearch nas instâncias autenticadas e mostra cada valor de index.mapping.total_fields.limit.",
     },
     "field_limit_selector": {"ES": "Instancias autenticadas", "EN": "Authenticated instances", "PT": "Instâncias autenticadas"},
+    "field_limit_use_all_instances": {"ES": "Usar todas las instancias autenticadas", "EN": "Use all authenticated instances", "PT": "Usar todas as instâncias autenticadas"},
+    "field_limit_all_instances_caption": {"ES": "Se usarán {count} instancias autenticadas.", "EN": "{count} authenticated instances will be used.", "PT": "{count} instâncias autenticadas serão usadas."},
+    "field_limit_use_all_update_instances": {"ES": "Usar todas las instancias autenticadas para modificar", "EN": "Use all authenticated instances for update", "PT": "Usar todas as instâncias autenticadas para atualizar"},
     "field_limit_include_hidden": {"ES": "Incluir índices del sistema / hidden indices", "EN": "Include system / hidden indices", "PT": "Incluir índices de sistema / hidden"},
     "field_limit_templates": {"ES": "Revisar index templates si están disponibles", "EN": "Inspect index templates when available", "PT": "Revisar index templates se disponíveis"},
     "field_limit_run": {"ES": "Ejecutar auditoría de límite de campos", "EN": "Run field limit audit", "PT": "Executar auditoria de limite de campos"},
@@ -551,6 +554,54 @@ def add_field_limit_log(rows: List[Dict[str, Any]], instance: str, operation: st
             "timestamp": now_ts(),
         }
     )
+
+
+def fetch_field_limit_templates(instance: Dict[str, str], headers: Dict[str, str], logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Best-effort template lookup for the Field Limits audit.
+
+    Template data enriches the report only; failures are logged as warnings and
+    never block the index-settings audit.
+    """
+    normalized: List[Dict[str, Any]] = []
+    resp = readonly_get(instance["base_url"], "/_index_template", headers)
+    add_field_limit_log(logs, instance["name"], "fetch_templates", resp.get("endpoint", "/_index_template"), resp.get("status_code"), short_message(resp))
+    if resp.get("ok"):
+        for template in extract_templates(resp.get("data", {})):
+            normalized.append(
+                {
+                    **template,
+                    "template_name": template.get("name", ""),
+                    "template_type": template.get("template_type", "composable"),
+                    "template_limit": template.get("limit") if template.get("limit") != "" else None,
+                    "raw": "",
+                }
+            )
+        return normalized
+
+    legacy = readonly_get(instance["base_url"], "/_template", headers)
+    add_field_limit_log(logs, instance["name"], "fetch_legacy_templates", legacy.get("endpoint", "/_template"), legacy.get("status_code"), short_message(legacy))
+    if legacy.get("ok"):
+        for template in extract_templates(legacy.get("data", {}), legacy=True):
+            normalized.append(
+                {
+                    **template,
+                    "template_name": template.get("name", ""),
+                    "template_type": template.get("template_type", "legacy"),
+                    "template_limit": template.get("limit") if template.get("limit") != "" else None,
+                    "raw": "",
+                }
+            )
+        return normalized
+
+    add_field_limit_log(
+        logs,
+        instance["name"],
+        "fetch_templates",
+        "/_index_template or /_template",
+        "warning",
+        legacy.get("message") or resp.get("message") or "Template inspection unavailable",
+    )
+    return []
 
 
 def list_field_limit_indices(instance: Dict[str, str], headers: Dict[str, str], include_hidden: bool, index_filter: str, logs: List[Dict[str, Any]]) -> List[str]:
@@ -1894,7 +1945,12 @@ with tab_field_limit:
     else:
         instance_labels = [f"{item['name']} ({item['base_url']})" for item in authenticated_instances]
         label_to_instance = dict(zip(instance_labels, authenticated_instances))
-        selected_labels = st.multiselect(t("field_limit_selector"), options=instance_labels, default=instance_labels, key="field_limit_instances")
+        use_all_audit_instances = st.checkbox(t("field_limit_use_all_instances"), value=True, key="field_limit_use_all_instances")
+        if use_all_audit_instances:
+            selected_labels = instance_labels
+            st.caption(t("field_limit_all_instances_caption", count=len(selected_labels)))
+        else:
+            selected_labels = st.multiselect(t("field_limit_selector"), options=instance_labels, default=[], key="field_limit_instances")
         selected_instances = [label_to_instance[label] for label in selected_labels]
 
         c1, c2, c3 = st.columns(3)
@@ -1922,7 +1978,20 @@ with tab_field_limit:
                 for idx, instance in enumerate(selected_instances, start=1):
                     status_box.caption(f"Checking {idx}/{total}: {instance['name']}")
                     instance_rows: List[Dict[str, Any]] = []
-                    templates = fetch_field_limit_templates(instance, headers, log_rows) if inspect_templates else []
+                    templates = []
+                    if inspect_templates:
+                        try:
+                            templates = fetch_field_limit_templates(instance, headers, log_rows)
+                        except Exception as exc:
+                            add_field_limit_log(
+                                log_rows,
+                                instance.get("name", ""),
+                                "fetch_templates",
+                                "/_index_template or /_template",
+                                "warning",
+                                truncate_detail(exc, 500),
+                            )
+                            templates = []
                     for template in templates:
                         template_details.append({"instance": instance["name"], "base_url": instance["base_url"], **template})
                     try:
@@ -2016,7 +2085,12 @@ with tab_field_limit:
                 new_limit = st.number_input(t("field_limit_new_limit"), min_value=1001, max_value=100000, value=2000, step=100, key="field_limit_new_limit")
                 update_template_flag = st.checkbox(t("field_limit_update_templates"), value=False, key="field_limit_update_templates")
             with u2:
-                update_labels = st.multiselect(t("field_limit_update_instances"), options=instance_labels, default=[], key="field_limit_update_instances")
+                use_all_update_instances = st.checkbox(t("field_limit_use_all_update_instances"), value=True, key="field_limit_use_all_update_instances")
+                if use_all_update_instances:
+                    update_labels = instance_labels
+                    st.caption(t("field_limit_all_instances_caption", count=len(update_labels)))
+                else:
+                    update_labels = st.multiselect(t("field_limit_update_instances"), options=instance_labels, default=[], key="field_limit_update_instances")
                 dry_run = st.checkbox(t("field_limit_dry_run"), value=True, key="field_limit_dry_run")
             mode_labels = {
                 t("field_limit_apply_selected"): "selected",
