@@ -333,22 +333,21 @@ def merge_template_limit(template_body: Dict[str, Any], template_type: str, new_
     raise UnsafeWriteRequestError("Unknown template type")
 
 
-def build_field_limit_excel(field_limit_rows: List[Dict[str, Any]], summary_rows: List[Dict[str, Any]], error_rows: List[Dict[str, Any]], log_rows: List[Dict[str, Any]] | None = None, update_preview: List[Dict[str, Any]] | None = None, update_results: List[Dict[str, Any]] | None = None, template_update_results: List[Dict[str, Any]] | None = None, template_details: List[Dict[str, Any]] | None = None) -> bytes:
+def build_field_limit_excel(instance_rows: List[Dict[str, Any]], technical_rows: List[Dict[str, Any]], error_rows: List[Dict[str, Any]], log_rows: List[Dict[str, Any]] | None = None, update_preview: List[Dict[str, Any]] | None = None, update_results: List[Dict[str, Any]] | None = None, template_update_results: List[Dict[str, Any]] | None = None, template_details: List[Dict[str, Any]] | None = None) -> bytes:
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        pd.DataFrame(field_limit_rows).to_excel(writer, index=False, sheet_name="field_limits")
-        pd.DataFrame(summary_rows).to_excel(writer, index=False, sheet_name="instance_summary")
+        pd.DataFrame(instance_rows).to_excel(writer, index=False, sheet_name="instance_limits")
         if update_preview:
             pd.DataFrame(update_preview).to_excel(writer, index=False, sheet_name="update_preview")
-        if update_results:
-            pd.DataFrame(update_results).to_excel(writer, index=False, sheet_name="update_results")
-        if template_update_results:
-            pd.DataFrame(template_update_results).to_excel(writer, index=False, sheet_name="template_update_results")
+        combined_update_results = (update_results or []) + (template_update_results or [])
+        if combined_update_results:
+            pd.DataFrame(combined_update_results).to_excel(writer, index=False, sheet_name="update_results")
+        technical_details = (technical_rows or []) + (template_details or [])
+        if technical_details:
+            pd.DataFrame(technical_details).to_excel(writer, index=False, sheet_name="technical_details")
         combined_logs = (error_rows or []) + (log_rows or [])
         if combined_logs:
             pd.DataFrame(combined_logs).to_excel(writer, index=False, sheet_name="errors_logs")
-        if template_details:
-            pd.DataFrame(template_details).to_excel(writer, index=False, sheet_name="template_details")
     return buffer.getvalue()
 
 

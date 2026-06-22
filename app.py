@@ -182,6 +182,12 @@ I18N = {
     "metric_indices_found": {"ES": "Índices encontrados", "EN": "Indices found", "PT": "Índices encontrados"},
     "metric_indices_configured": {"ES": "Índices con límite configurado", "EN": "Indices with configured limit", "PT": "Índices com limite configurado"},
     "metric_indices_not_configured": {"ES": "Índices sin límite configurado", "EN": "Indices without configured limit", "PT": "Índices sem limite configurado"},
+    "metric_instances_configured": {"ES": "Instancias con límite configurado", "EN": "Instances with configured limit", "PT": "Instâncias com limite configurado"},
+    "metric_instances_default": {"ES": "Instancias en default 1000", "EN": "Instances using default 1000", "PT": "Instâncias em default 1000"},
+    "metric_highest_limit": {"ES": "Límite máximo detectado", "EN": "Highest limit detected", "PT": "Maior limite detectado"},
+    "field_limit_technical_details": {"ES": "Detalles técnicos", "EN": "Technical details", "PT": "Detalhes técnicos"},
+    "field_limit_technical_update_details": {"ES": "Detalle técnico del cambio", "EN": "Technical update details", "PT": "Detalhe técnico da alteração"},
+    "field_limit_select_rows_to_update": {"ES": "Selecciona una o más instancias en la tabla para modificar el límite.", "EN": "Select one or more instances in the table to update the limit.", "PT": "Selecione uma ou mais instâncias na tabela para atualizar o limite."},
     "field_limit_select_instances": {"ES": "Seleccionar instancias", "EN": "Select instances", "PT": "Selecionar instâncias"},
     "field_limit_increase_title": {"ES": "Aumentar límite de campos", "EN": "Increase field limit", "PT": "Aumentar limite de campos"},
     "field_limit_new_limit": {"ES": "Nuevo límite", "EN": "New limit", "PT": "Novo limite"},
@@ -195,8 +201,8 @@ I18N = {
     "field_limit_prepare": {"ES": "Preparar cambio", "EN": "Prepare update", "PT": "Preparar alteração"},
     "field_limit_apply_confirmed": {"ES": "Aplicar cambio confirmado", "EN": "Apply confirmed update", "PT": "Aplicar alteração confirmada"},
     "field_limit_confirm_text": {
-        "ES": "Esta acción configurará explícitamente index.mapping.total_fields.limit en los índices seleccionados.",
-        "EN": "This action will explicitly configure index.mapping.total_fields.limit on the selected indices.",
+        "ES": "Esta acción configurará explícitamente index.mapping.total_fields.limit en las instancias seleccionadas.",
+        "EN": "This action will explicitly configure index.mapping.total_fields.limit on the selected instances.",
         "PT": "Esta ação modificará index.mapping.total_fields.limit nos índices selecionados. Confirme que deseja continuar.",
     },
     "field_limit_missing_note": {
@@ -310,6 +316,8 @@ if "field_limit_template_update_results" not in st.session_state:
     st.session_state.field_limit_template_update_results = []
 if "field_limit_template_details" not in st.session_state:
     st.session_state.field_limit_template_details = []
+if "field_limit_update_detail_preview" not in st.session_state:
+    st.session_state.field_limit_update_detail_preview = []
 
 
 def get_auth_headers() -> Dict[str, str]:
@@ -815,6 +823,95 @@ def apply_field_limit_template_updates(preview_rows: List[Dict[str, Any]], templ
     return results
 
 
+def build_instance_limit_row(instance: Dict[str, str], index_rows: List[Dict[str, Any]], template_rows: List[Dict[str, Any]], fatal_error: str = "") -> Dict[str, Any]:
+    checked_at = now_ts()
+    if fatal_error:
+        return {
+            "instance": instance.get("name", ""),
+            "base_url": instance.get("base_url", ""),
+            "current_effective_limit": "",
+            "explicit_limit_configured": False,
+            "detected_source": "error",
+            "configured_indices_count": 0,
+            "configured_templates_count": 0,
+            "max_configured_index_limit": "",
+            "max_configured_template_limit": "",
+            "status": "error",
+            "checked_at": checked_at,
+            "error_message": fatal_error,
+        }
+
+    index_limits = [
+        int(row.get("configured_limit"))
+        for row in index_rows
+        if row.get("configured_limit_status") == "configured" and str(row.get("configured_limit", "")).isdigit()
+    ]
+    template_limits = [
+        int(row.get("template_limit") if row.get("template_limit") is not None else row.get("limit"))
+        for row in template_rows
+        if str(row.get("template_limit") if row.get("template_limit") is not None else row.get("limit", "")).isdigit()
+    ]
+    all_limits = index_limits + template_limits
+    has_index = bool(index_limits)
+    has_template = bool(template_limits)
+    if has_index and has_template:
+        detected_source = "index_settings_and_template"
+    elif has_index:
+        detected_source = "index_settings"
+    elif has_template:
+        detected_source = "template"
+    else:
+        detected_source = "default"
+
+    current_effective_limit = max(all_limits) if all_limits else 1000
+    distinct_limits = set(all_limits)
+    if not all_limits:
+        status = "default_1000"
+    elif len(distinct_limits) > 1:
+        status = "mixed_values"
+    elif current_effective_limit > 1000:
+        status = "configured_above_1000"
+    else:
+        status = "configured_1000_or_less"
+
+    return {
+        "instance": instance.get("name", ""),
+        "base_url": instance.get("base_url", ""),
+        "current_effective_limit": current_effective_limit,
+        "explicit_limit_configured": bool(all_limits),
+        "detected_source": detected_source,
+        "configured_indices_count": len(index_limits),
+        "configured_templates_count": len(template_limits),
+        "max_configured_index_limit": max(index_limits) if index_limits else "",
+        "max_configured_template_limit": max(template_limits) if template_limits else "",
+        "status": status,
+        "checked_at": checked_at,
+    }
+
+
+def build_instance_update_preview(instance_rows: List[Dict[str, Any]], selected_names: set[str], new_limit: int, dry_run: bool) -> List[Dict[str, Any]]:
+    preview = []
+    for row in instance_rows:
+        if row.get("instance") not in selected_names:
+            continue
+        current = row.get("current_effective_limit")
+        update_required = str(current).isdigit() and int(current) < int(new_limit)
+        preview.append(
+            {
+                "instance": row.get("instance", ""),
+                "base_url": row.get("base_url", ""),
+                "current_effective_limit": current,
+                "new_limit": int(new_limit),
+                "explicit_limit_configured": bool(row.get("explicit_limit_configured")),
+                "detected_source": row.get("detected_source", ""),
+                "update_required": bool(update_required),
+                "action": "dry_run" if dry_run else "update",
+                "status": "ready" if update_required else "skipped",
+            }
+        )
+    return preview
+
+
 def reset_auth_dependent_state() -> None:
     st.session_state.instance_auth = {}
     st.session_state.auth_report_df = pd.DataFrame()
@@ -834,6 +931,7 @@ def reset_auth_dependent_state() -> None:
     st.session_state.field_limit_update_results = []
     st.session_state.field_limit_template_update_results = []
     st.session_state.field_limit_template_details = []
+    st.session_state.field_limit_update_detail_preview = []
 
 
 def reset_delete_section_state() -> None:
@@ -2010,7 +2108,7 @@ with tab_field_limit:
                     except Exception as exc:
                         message = truncate_detail(exc, 500)
                         error_rows.append({"instance": instance["name"], "operation": "cat_indices", "endpoint": "/_cat/indices", "status": "error", "message": message, "timestamp": now_ts()})
-                        summary_rows.append(build_instance_summary(instance, [], fatal_error=message))
+                        summary_rows.append(build_instance_limit_row(instance, [], [], fatal_error=message))
                         progress.progress(idx / total)
                         continue
                     status_box.caption(f"Checking {idx}/{total}: {instance['name']} — fetching settings")
@@ -2058,7 +2156,8 @@ with tab_field_limit:
                             error_rows.append({"instance": instance["name"], "operation": "index_settings", "endpoint": index_name, "status": "error", "message": row["error_message"], "timestamp": row["checked_at"]})
                         instance_rows.append(row)
                         field_limit_rows.append(row)
-                    summary_rows.append(build_instance_summary(instance, instance_rows))
+                    instance_template_rows = [row for row in template_details if row.get("instance") == instance["name"]]
+                    summary_rows.append(build_instance_limit_row(instance, instance_rows, instance_template_rows))
                     status_box.caption(f"Checking {idx}/{total}: {instance['name']} — completed")
                     progress.progress(idx / total)
 
@@ -2068,6 +2167,7 @@ with tab_field_limit:
                 st.session_state.field_limit_log_rows = log_rows
                 st.session_state.field_limit_template_details = template_details
                 st.session_state.field_limit_update_preview = []
+                st.session_state.field_limit_update_detail_preview = []
                 st.session_state.field_limit_update_results = []
                 st.session_state.field_limit_template_update_results = []
                 status_box.caption("Field limit audit completed")
@@ -2081,106 +2181,99 @@ with tab_field_limit:
         update_results = st.session_state.get("field_limit_update_results", [])
         template_update_results = st.session_state.get("field_limit_template_update_results", [])
 
-        if field_limit_rows:
-            limits_df = pd.DataFrame(field_limit_rows)
-            summary_df = pd.DataFrame(summary_rows)
-            e1, e2, e3, e4, e5, e6 = st.columns(6)
-            e1.metric(t("metric_instances_checked"), len(summary_rows))
-            e2.metric(t("metric_indices_found"), len(limits_df))
-            e3.metric(t("metric_indices_configured"), int((limits_df["configured_limit_status"] == "configured").sum()))
-            e4.metric(t("metric_indices_above"), int(limits_df["above_1000"].sum()))
-            e5.metric(t("metric_indices_not_configured"), int((limits_df["configured_limit_status"] == "not_configured").sum()))
-            e6.metric(t("metric_errors"), int((limits_df["status"] == "error").sum()) + len(error_rows))
+        if summary_rows:
+            instance_df = pd.DataFrame(summary_rows)
+            technical_df = pd.DataFrame(field_limit_rows)
+            e1, e2, e3, e4, e5 = st.columns(5)
+            e1.metric(t("metric_instances_checked"), len(instance_df))
+            e2.metric(t("metric_instances_configured"), int(instance_df["explicit_limit_configured"].sum()))
+            e3.metric(t("metric_instances_default"), int((instance_df["detected_source"] == "default").sum()))
+            numeric_limits = pd.to_numeric(instance_df["current_effective_limit"], errors="coerce")
+            e4.metric(t("metric_highest_limit"), int(numeric_limits.max()) if not numeric_limits.dropna().empty else "")
+            e5.metric(t("metric_errors"), int((instance_df["status"] == "error").sum()) + len(error_rows))
 
-            display_df = limits_df.copy()
+            display_df = instance_df.copy()
             display_df.insert(0, "selected", False)
-            preferred_columns = [
+            main_columns = [
                 "selected",
                 "instance",
                 "base_url",
-                "index_name",
-                "configured_limit",
-                "configured_limit_status",
-                "effective_default",
-                "above_1000",
-                "raw_setting_path",
-                "template_limit",
-                "template_name",
+                "current_effective_limit",
+                "explicit_limit_configured",
+                "detected_source",
+                "configured_indices_count",
+                "configured_templates_count",
+                "max_configured_index_limit",
+                "max_configured_template_limit",
                 "status",
                 "checked_at",
             ]
-            display_df = display_df[[col for col in preferred_columns if col in display_df.columns] + [col for col in display_df.columns if col not in preferred_columns]]
-            edited_df = st.data_editor(display_df, use_container_width=True, key="field_limit_table", disabled=[c for c in display_df.columns if c != "selected"])
-            selected_keys = set()
+            display_df = display_df[[col for col in main_columns if col in display_df.columns]]
+            edited_df = st.data_editor(display_df, use_container_width=True, key="field_limit_instance_table", disabled=[c for c in display_df.columns if c != "selected"])
+            selected_instance_names = set()
             if isinstance(edited_df, pd.DataFrame) and "selected" in edited_df.columns:
-                selected_keys = set(
-                    (str(row["instance"]), str(row["index_name"]))
-                    for row in edited_df[edited_df["selected"] == True].to_dict("records")
-                )
-            st.session_state.field_limit_selected_keys = selected_keys
+                selected_instance_names = set(str(row["instance"]) for row in edited_df[edited_df["selected"] == True].to_dict("records"))
+            st.session_state.field_limit_selected_instances = selected_instance_names
 
-            with st.expander("Instance summary", expanded=False):
-                st.dataframe(summary_df, use_container_width=True)
+            with st.expander(t("field_limit_technical_details"), expanded=False):
+                if field_limit_rows:
+                    st.dataframe(technical_df, use_container_width=True)
+                if template_details:
+                    st.dataframe(pd.DataFrame(template_details), use_container_width=True)
             with st.expander("Errors / logs", expanded=False):
                 if error_rows:
                     st.dataframe(pd.DataFrame(error_rows), use_container_width=True)
                 if log_rows:
                     st.dataframe(pd.DataFrame(log_rows), use_container_width=True)
-            with st.expander("Template details", expanded=False):
-                if template_details:
-                    st.dataframe(pd.DataFrame(template_details), use_container_width=True)
-                else:
-                    st.caption("No template details available.")
 
             st.divider()
             st.subheader(t("field_limit_increase_title"))
-            u1, u2 = st.columns(2)
-            with u1:
-                new_limit = st.number_input(t("field_limit_new_limit"), min_value=1001, max_value=100000, value=2000, step=100, key="field_limit_new_limit")
-                update_template_flag = st.checkbox(t("field_limit_update_templates"), value=False, key="field_limit_update_templates")
-            with u2:
-                use_all_update_instances = st.checkbox(t("field_limit_use_all_update_instances"), value=True, key="field_limit_use_all_update_instances")
-                if use_all_update_instances:
-                    update_labels = instance_labels
-                    st.caption(t("field_limit_all_instances_caption", count=len(update_labels)))
-                else:
-                    update_labels = st.multiselect(t("field_limit_update_instances"), options=instance_labels, default=[], key="field_limit_update_instances")
-                dry_run = st.checkbox(t("field_limit_dry_run"), value=True, key="field_limit_dry_run")
-            mode_labels = {
-                t("field_limit_apply_selected"): "selected",
-                t("field_limit_apply_default"): "default",
-                t("field_limit_apply_lower"): "lower",
-            }
-            apply_mode_label = st.selectbox(t("field_limit_apply_to"), options=list(mode_labels.keys()), index=0, key="field_limit_apply_mode")
-            update_instance_names = [label_to_instance[label]["name"] for label in update_labels]
+            selected_instance_rows = [row for row in summary_rows if row.get("instance") in selected_instance_names]
+            if not selected_instance_rows:
+                st.info(t("field_limit_select_rows_to_update"))
+                new_limit = 2000
+                update_template_flag = False
+                dry_run = True
+            else:
+                u1, u2 = st.columns(2)
+                with u1:
+                    new_limit = st.number_input(t("field_limit_new_limit"), min_value=1001, max_value=100000, value=2000, step=100, key="field_limit_new_limit")
+                    update_template_flag = st.checkbox(t("field_limit_update_templates"), value=False, key="field_limit_update_templates")
+                with u2:
+                    dry_run = st.checkbox(t("field_limit_dry_run"), value=True, key="field_limit_dry_run")
 
-            if st.button(t("field_limit_prepare"), key="field_limit_prepare_update"):
-                preview = build_update_preview(
-                    field_limit_rows,
-                    update_instance_names,
-                    st.session_state.get("field_limit_selected_keys", set()),
-                    mode_labels[apply_mode_label],
-                    int(new_limit),
-                    bool(update_template_flag),
-                    bool(dry_run),
-                )
-                st.session_state.field_limit_update_preview = preview
-                st.session_state.field_limit_update_results = apply_field_limit_updates(preview, headers) if dry_run else []
-                st.session_state.field_limit_template_update_results = (
-                    apply_field_limit_template_updates(preview, template_details, headers, True) if update_template_flag else []
-                )
+                if st.button(t("field_limit_prepare"), key="field_limit_prepare_update"):
+                    instance_preview = build_instance_update_preview(summary_rows, selected_instance_names, int(new_limit), bool(dry_run))
+                    technical_preview = build_update_preview(
+                        field_limit_rows,
+                        selected_instance_names,
+                        set(),
+                        "lower",
+                        int(new_limit),
+                        bool(update_template_flag),
+                        bool(dry_run),
+                    )
+                    st.session_state.field_limit_update_preview = instance_preview
+                    st.session_state.field_limit_update_detail_preview = technical_preview
+                    st.session_state.field_limit_update_results = apply_field_limit_updates(technical_preview, headers) if dry_run else []
+                    st.session_state.field_limit_template_update_results = (
+                        apply_field_limit_template_updates(technical_preview, template_details, headers, True) if update_template_flag else []
+                    )
 
             update_preview = st.session_state.get("field_limit_update_preview", [])
+            technical_update_preview = st.session_state.get("field_limit_update_detail_preview", [])
             if update_preview:
                 st.markdown("### Update preview")
                 preview_df = pd.DataFrame(update_preview)
-                st.dataframe(preview_df[["instance", "index_name", "configured_limit", "effective_default", "new_limit", "update_required", "reason", "action", "status"]], use_container_width=True)
-                affected_instances = preview_df[preview_df["update_required"] == True]["instance"].nunique()
-                affected_indices = int((preview_df["update_required"] == True).sum())
+                st.dataframe(preview_df[["instance", "current_effective_limit", "new_limit", "explicit_limit_configured", "detected_source", "update_required", "action", "status"]], use_container_width=True)
+                with st.expander(t("field_limit_technical_update_details"), expanded=False):
+                    if technical_update_preview:
+                        st.dataframe(pd.DataFrame(technical_update_preview), use_container_width=True)
+                affected_instances = int((preview_df["update_required"] == True).sum())
                 st.warning(
                     f"{t('field_limit_confirm_text')}\n\n"
-                    f"Instances affected: {affected_instances} | Indices affected: {affected_indices} | New limit: {int(new_limit)} | "
-                    f"Templates: {bool(update_template_flag)} | Dry run: {bool(dry_run)}"
+                    f"Instances selected: {len(preview_df)} | Instances affected: {affected_instances} | New limit: {int(preview_df['new_limit'].iloc[0])} | "
+                    f"Templates: {bool(st.session_state.get('field_limit_update_templates', False))} | Dry run: {bool(st.session_state.get('field_limit_dry_run', True))}"
                 )
                 confirm_ok = st.checkbox("I understand and want to continue", value=False, key="field_limit_confirm_checkbox")
                 confirm_text = st.text_input("Type CONFIRM", value="", key="field_limit_confirm_text_input")
@@ -2188,10 +2281,11 @@ with tab_field_limit:
                     if not confirm_ok or confirm_text != "CONFIRM":
                         st.error("Confirmation is required.")
                     else:
-                        st.session_state.field_limit_update_results = apply_field_limit_updates(update_preview, headers)
-                        if update_template_flag:
+                        detail_preview = st.session_state.get("field_limit_update_detail_preview", [])
+                        st.session_state.field_limit_update_results = apply_field_limit_updates(detail_preview, headers)
+                        if st.session_state.get("field_limit_update_templates", False):
                             st.session_state.field_limit_template_update_results = apply_field_limit_template_updates(
-                                update_preview, template_details, headers, dry_run
+                                detail_preview, template_details, headers, st.session_state.get("field_limit_dry_run", True)
                             )
                         st.success("Update process finished. Rerun the audit to verify current values.")
 
@@ -2206,8 +2300,8 @@ with tab_field_limit:
             st.download_button(
                 t("field_limit_export"),
                 data=build_field_limit_excel(
-                    field_limit_rows,
                     summary_rows,
+                    field_limit_rows,
                     error_rows,
                     log_rows,
                     st.session_state.get("field_limit_update_preview", []),

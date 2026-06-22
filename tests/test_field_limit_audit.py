@@ -1,4 +1,9 @@
+from io import BytesIO
+
+import pandas as pd
+
 from field_limit_audit import (
+    build_field_limit_excel,
     build_instance_summary,
     build_update_preview,
     extract_data_views,
@@ -120,3 +125,18 @@ def test_merge_template_limit_handles_named_composable_get_response():
     merged = merge_template_limit(body, "composable", 2500)
     assert merged["index_patterns"] == ["logs-*"]
     assert merged["template"]["settings"]["index.mapping.total_fields.limit"] == 2500
+
+
+def test_build_field_limit_excel_uses_simplified_sheet_names():
+    data = build_field_limit_excel(
+        [{"instance": "i", "current_effective_limit": 1000}],
+        [{"instance": "i", "index_name": "a"}],
+        [],
+        [],
+        [{"instance": "i", "new_limit": 2000}],
+        [{"instance": "i", "updated": False}],
+        [],
+        [],
+    )
+    workbook = pd.ExcelFile(BytesIO(data))
+    assert workbook.sheet_names == ["instance_limits", "update_preview", "update_results", "technical_details"]
