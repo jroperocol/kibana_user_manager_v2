@@ -141,16 +141,51 @@ def parse_total_fields_limit(settings_payload: Any, index_name: str | None = Non
             settings = next(iter(settings_payload.values())).get("settings", {}) or {}
         else:
             settings = settings_payload.get("settings", settings_payload) or {}
-    value = settings.get(FIELD_LIMIT_KEY)
-    if value is None:
-        value = (((settings.get("index") or {}).get("mapping") or {}).get("total_fields") or {}).get("limit")
-    if value is None:
-        return {"total_fields_limit": DEFAULT_FIELD_LIMIT, "default_assumed": True, "above_1000": False, "status": "default_assumed", "error_message": ""}
+
+    configured_value = None
+    raw_setting_path = ""
+    if isinstance(settings, dict):
+        if FIELD_LIMIT_KEY in settings:
+            configured_value = settings.get(FIELD_LIMIT_KEY)
+            raw_setting_path = FIELD_LIMIT_KEY
+        else:
+            configured_value = (((settings.get("index") or {}).get("mapping") or {}).get("total_fields") or {}).get("limit")
+            if configured_value is not None:
+                raw_setting_path = "settings.index.mapping.total_fields.limit"
+
+    if configured_value is None:
+        return {
+            "configured_limit": None,
+            "configured_limit_status": "not_configured",
+            "effective_default": DEFAULT_FIELD_LIMIT,
+            "above_1000": False,
+            "raw_setting_path": "",
+            "status": "not_configured",
+            "error_message": "",
+        }
+
     try:
-        numeric = int(value)
+        numeric = int(configured_value)
     except (TypeError, ValueError):
-        return {"total_fields_limit": "", "default_assumed": False, "above_1000": False, "status": "error", "error_message": f"Non-numeric {FIELD_LIMIT_KEY}: {value}"}
-    return {"total_fields_limit": numeric, "default_assumed": False, "above_1000": numeric > DEFAULT_FIELD_LIMIT, "status": "above_1000" if numeric > DEFAULT_FIELD_LIMIT else "ok", "error_message": ""}
+        return {
+            "configured_limit": configured_value,
+            "configured_limit_status": "parse_error",
+            "effective_default": None,
+            "above_1000": False,
+            "raw_setting_path": raw_setting_path,
+            "status": "error",
+            "error_message": f"Non-numeric {FIELD_LIMIT_KEY}: {configured_value}",
+        }
+
+    return {
+        "configured_limit": configured_value,
+        "configured_limit_status": "configured",
+        "effective_default": None,
+        "above_1000": numeric > DEFAULT_FIELD_LIMIT,
+        "raw_setting_path": raw_setting_path,
+        "status": "configured_above_1000" if numeric > DEFAULT_FIELD_LIMIT else "configured_1000_or_less",
+        "error_message": "",
+    }
 
 
 def extract_indices_from_cat(payload: Any) -> List[str]:
@@ -213,14 +248,16 @@ def match_templates(templates: List[Dict[str, Any]], index_name: str) -> List[Di
 def build_instance_summary(instance: Dict[str, str], detail_rows: List[Dict[str, Any]], data_views_checked: int = 0, fatal_error: str = "") -> Dict[str, Any]:
     successful = [r for r in detail_rows if r.get("status") != "error"]
     failed = [r for r in detail_rows if r.get("status") == "error"]
-    above = [r for r in successful if bool(r.get("above_1000"))]
-    default = [r for r in successful if bool(r.get("default_assumed"))]
-    max_limits = [int(r["total_fields_limit"]) for r in successful if str(r.get("total_fields_limit", "")).isdigit()]
+    configured = [r for r in successful if r.get("configured_limit_status") == "configured"]
+    not_configured = [r for r in successful if r.get("configured_limit_status") == "not_configured"]
+    above = [r for r in configured if bool(r.get("above_1000"))]
+    max_limits = [int(r["configured_limit"]) for r in configured if str(r.get("configured_limit", "")).isdigit()]
     status = "failed" if fatal_error else ("partial" if successful and failed else ("failed" if failed and not successful else "ok"))
     return {
         "instance": instance.get("name", ""), "base_url": instance.get("base_url", ""), "auth_status": "authenticated",
-        "indices_found": len(detail_rows), "indices_checked": len(successful), "indices_above_1000": len(above),
-        "indices_default_1000": len(default), "indices_failed": len(failed), "max_detected_limit": max(max_limits) if max_limits else "",
+        "indices_found": len(detail_rows), "indices_checked": len(successful), "indices_with_configured_limit": len(configured),
+        "indices_above_1000": len(above), "indices_not_configured": len(not_configured), "indices_failed": len(failed),
+        "max_detected_limit": max(max_limits) if max_limits else "",
         "workaround_detected": bool(above), "status": status, "error_message": fatal_error,
     }
 
@@ -228,24 +265,49 @@ def build_instance_summary(instance: Dict[str, str], detail_rows: List[Dict[str,
 def build_update_preview(field_limit_rows: List[Dict[str, Any]], instance_names: List[str], selected_keys: set[tuple[str, str]], apply_mode: str, new_limit: int, update_templates: bool, dry_run: bool) -> List[Dict[str, Any]]:
     preview: List[Dict[str, Any]] = []
     for row in field_limit_rows:
-        if row.get("instance") not in instance_names or row.get("status") == "error":
+        if row.get("instance") not in instance_names:
             continue
         key = (str(row.get("instance", "")), str(row.get("index_name", "")))
-        current = row.get("total_fields_limit")
         if apply_mode == "selected" and key not in selected_keys:
             continue
-        if apply_mode == "default" and not row.get("default_assumed"):
+
+        status = str(row.get("status", ""))
+        configured_status = str(row.get("configured_limit_status", ""))
+        configured_limit = row.get("configured_limit")
+        effective_default = row.get("effective_default")
+        reason = ""
+        update_required = False
+
+        if status == "error" or configured_status in {"parse_error", "request_error"}:
+            reason = configured_status or "request_error"
+        elif configured_status == "not_configured":
+            reason = "not_configured_effective_default_1000"
+            update_required = int(effective_default or DEFAULT_FIELD_LIMIT) < int(new_limit)
+        elif str(configured_limit).isdigit() and int(configured_limit) < int(new_limit):
+            reason = "configured_below_new_limit"
+            update_required = True
+        else:
+            reason = "already_at_or_above_new_limit"
+
+        if apply_mode == "default" and configured_status != "not_configured":
             continue
-        if apply_mode == "lower" and (not str(current).isdigit() or int(current) >= int(new_limit)):
+        if apply_mode == "lower" and not update_required:
             continue
-        update_required = str(current).isdigit() and int(current) < int(new_limit)
-        status = "ready" if update_required else "skipped_current_limit_ge_new_limit"
+
         preview.append({
-            "instance": row.get("instance", ""), "base_url": row.get("base_url", ""), "index_name": row.get("index_name", ""),
-            "current_limit": current, "new_limit": int(new_limit), "default_assumed": bool(row.get("default_assumed")),
-            "update_required": bool(update_required), "template_name": row.get("template_name", ""),
-            "template_current_limit": row.get("template_limit", ""), "template_new_limit": int(new_limit) if update_templates and row.get("template_name") else "",
-            "action": "dry_run" if dry_run else "update", "status": status,
+            "instance": row.get("instance", ""),
+            "base_url": row.get("base_url", ""),
+            "index_name": row.get("index_name", ""),
+            "configured_limit": configured_limit,
+            "effective_default": effective_default,
+            "new_limit": int(new_limit),
+            "update_required": bool(update_required),
+            "reason": reason,
+            "template_name": row.get("template_name", ""),
+            "template_current_limit": row.get("template_limit", ""),
+            "template_new_limit": int(new_limit) if update_templates and row.get("template_name") else "",
+            "action": "dry_run" if dry_run else "update",
+            "status": "ready" if update_required else "skipped",
         })
     return preview
 

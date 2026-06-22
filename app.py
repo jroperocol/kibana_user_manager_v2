@@ -180,23 +180,29 @@ I18N = {
     "metric_errors": {"ES": "Con errores", "EN": "With errors", "PT": "Com erros"},
     "metric_indices_above": {"ES": "Índices > 1000", "EN": "Indices > 1000", "PT": "Índices > 1000"},
     "metric_indices_found": {"ES": "Índices encontrados", "EN": "Indices found", "PT": "Índices encontrados"},
-    "metric_indices_default": {"ES": "Índices con default 1000", "EN": "Indices with default 1000", "PT": "Índices com default 1000"},
+    "metric_indices_configured": {"ES": "Índices con límite configurado", "EN": "Indices with configured limit", "PT": "Índices com limite configurado"},
+    "metric_indices_not_configured": {"ES": "Índices sin límite configurado", "EN": "Indices without configured limit", "PT": "Índices sem limite configurado"},
     "field_limit_select_instances": {"ES": "Seleccionar instancias", "EN": "Select instances", "PT": "Selecionar instâncias"},
     "field_limit_increase_title": {"ES": "Aumentar límite de campos", "EN": "Increase field limit", "PT": "Aumentar limite de campos"},
     "field_limit_new_limit": {"ES": "Nuevo límite", "EN": "New limit", "PT": "Novo limite"},
     "field_limit_update_instances": {"ES": "Instancias a modificar", "EN": "Instances to update", "PT": "Instâncias para atualizar"},
     "field_limit_apply_to": {"ES": "Aplicar a", "EN": "Apply to", "PT": "Aplicar a"},
     "field_limit_apply_selected": {"ES": "Solo índices seleccionados en la tabla", "EN": "Only selected indices in the table", "PT": "Só índices selecionados na tabela"},
-    "field_limit_apply_default": {"ES": "Todos los índices con límite default 1000", "EN": "All indices with default limit 1000", "PT": "Todos os índices com limite default 1000"},
+    "field_limit_apply_default": {"ES": "Todos los índices sin límite configurado", "EN": "All indices without configured limit", "PT": "Todos os índices sem limite configurado"},
     "field_limit_apply_lower": {"ES": "Todos los índices con límite menor al nuevo valor", "EN": "All indices with limit lower than the new value", "PT": "Todos os índices com limite menor que o novo valor"},
     "field_limit_update_templates": {"ES": "Actualizar templates relacionados para futuros índices", "EN": "Update related templates for future indices", "PT": "Atualizar templates relacionados para índices futuros"},
     "field_limit_dry_run": {"ES": "Solo simular, no aplicar cambios", "EN": "Dry run only, do not apply changes", "PT": "Só simular, não aplicar alterações"},
     "field_limit_prepare": {"ES": "Preparar cambio", "EN": "Prepare update", "PT": "Preparar alteração"},
     "field_limit_apply_confirmed": {"ES": "Aplicar cambio confirmado", "EN": "Apply confirmed update", "PT": "Aplicar alteração confirmada"},
     "field_limit_confirm_text": {
-        "ES": "Esta acción modificará index.mapping.total_fields.limit en los índices seleccionados. Confirma que deseas continuar.",
-        "EN": "This action will modify index.mapping.total_fields.limit on the selected indices. Please confirm you want to continue.",
+        "ES": "Esta acción configurará explícitamente index.mapping.total_fields.limit en los índices seleccionados.",
+        "EN": "This action will explicitly configure index.mapping.total_fields.limit on the selected indices.",
         "PT": "Esta ação modificará index.mapping.total_fields.limit nos índices selecionados. Confirme que deseja continuar.",
+    },
+    "field_limit_missing_note": {
+        "ES": "Nota: si el campo no aparece en GET /<index_name>/_settings, se mostrará como no configurado. Elasticsearch usa 1000 como default efectivo, pero ese valor no está guardado explícitamente en el índice.",
+        "EN": "Note: if the field does not appear in GET /<index_name>/_settings, it will be shown as not configured. Elasticsearch uses 1000 as the effective default, but that value is not explicitly stored in the index.",
+        "PT": "Nota: se o campo não aparecer em GET /<index_name>/_settings, ele será mostrado como não configurado. O Elasticsearch usa 1000 como default efetivo, mas esse valor não fica salvo explicitamente no índice.",
     },
 }
 
@@ -620,9 +626,17 @@ def fetch_bulk_field_limits(instance: Dict[str, str], headers: Dict[str, str], i
         instance["base_url"],
         "/_settings",
         headers,
-        params={"flat_settings": "true", "expand_wildcards": expand, "filter_path": "*.settings.index.mapping.total_fields.limit"},
+        params={"flat_settings": "false", "expand_wildcards": expand, "filter_path": "*.settings.index.mapping.total_fields.limit"},
     )
     add_field_limit_log(logs, instance["name"], "get_bulk_settings", resp.get("endpoint", "/_settings"), resp.get("status_code"), short_message(resp))
+    if not resp.get("ok"):
+        resp = readonly_get(
+            instance["base_url"],
+            "/_settings",
+            headers,
+            params={"flat_settings": "true", "expand_wildcards": expand, "filter_path": "*.settings.index.mapping.total_fields.limit"},
+        )
+        add_field_limit_log(logs, instance["name"], "get_bulk_settings_flat", resp.get("endpoint", "/_settings"), resp.get("status_code"), short_message(resp))
     if not resp.get("ok") or not isinstance(resp.get("data"), dict):
         return {}, False
     parsed: Dict[str, Dict[str, Any]] = {}
@@ -638,14 +652,14 @@ def fetch_index_field_limit_direct(instance: Dict[str, str], headers: Dict[str, 
         instance["base_url"],
         endpoint,
         headers,
-        params={"flat_settings": "true", "filter_path": "*.settings.index.mapping.total_fields.limit"},
+        params={"flat_settings": "false", "filter_path": "*.settings.index.mapping.total_fields.limit"},
     )
     add_field_limit_log(logs, instance["name"], "get_index_settings_filtered", resp.get("endpoint", endpoint), resp.get("status_code"), short_message(resp))
     if not resp.get("ok"):
         resp = readonly_get(instance["base_url"], endpoint, headers, params={"flat_settings": "true"})
         add_field_limit_log(logs, instance["name"], "get_index_settings", resp.get("endpoint", endpoint), resp.get("status_code"), short_message(resp))
         if not resp.get("ok"):
-            return {"total_fields_limit": "", "default_assumed": False, "above_1000": False, "status": "error", "error_message": str(resp.get("message") or "settings request failed")}
+            return {"configured_limit": None, "configured_limit_status": "request_error", "effective_default": None, "above_1000": False, "raw_setting_path": "", "status": "error", "error_message": str(resp.get("message") or "settings request failed")}
     return parse_total_fields_limit(resp.get("data", {}), index_name)
 
 
@@ -659,7 +673,7 @@ def apply_field_limit_updates(preview_rows: List[Dict[str, Any]], headers: Dict[
                 {
                     "instance": row.get("instance", ""),
                     "index_name": row.get("index_name", ""),
-                    "previous_limit": row.get("current_limit", ""),
+                    "previous_limit": row.get("configured_limit", ""),
                     "new_limit": row.get("new_limit", ""),
                     "updated": False,
                     "status_code": "",
@@ -674,7 +688,7 @@ def apply_field_limit_updates(preview_rows: List[Dict[str, Any]], headers: Dict[
             {
                 "instance": row.get("instance", ""),
                 "index_name": row.get("index_name", ""),
-                "previous_limit": row.get("current_limit", ""),
+                "previous_limit": row.get("configured_limit", ""),
                 "new_limit": row.get("new_limit", ""),
                 "updated": bool(resp.get("ok")),
                 "status_code": resp.get("status_code", ""),
@@ -1950,6 +1964,7 @@ with tab_index:
 with tab_field_limit:
     st.subheader(t("tab_field_limit"))
     st.write(t("field_limit_description"))
+    st.caption(t("field_limit_missing_note"))
     authenticated_instances = st.session_state.get("authenticated_instances", [])
     headers = get_effective_auth_headers()
 
@@ -2028,9 +2043,11 @@ with tab_field_limit:
                             "instance": instance["name"],
                             "base_url": instance["base_url"],
                             "index_name": index_name,
-                            "total_fields_limit": parsed.get("total_fields_limit", ""),
-                            "default_assumed": parsed.get("default_assumed", False),
+                            "configured_limit": parsed.get("configured_limit"),
+                            "configured_limit_status": parsed.get("configured_limit_status", ""),
+                            "effective_default": parsed.get("effective_default"),
                             "above_1000": parsed.get("above_1000", False),
+                            "raw_setting_path": parsed.get("raw_setting_path", ""),
                             "template_limit": template_limit,
                             "template_name": template_name,
                             "status": parsed.get("status", ""),
@@ -2067,15 +2084,32 @@ with tab_field_limit:
         if field_limit_rows:
             limits_df = pd.DataFrame(field_limit_rows)
             summary_df = pd.DataFrame(summary_rows)
-            e1, e2, e3, e4, e5 = st.columns(5)
+            e1, e2, e3, e4, e5, e6 = st.columns(6)
             e1.metric(t("metric_instances_checked"), len(summary_rows))
             e2.metric(t("metric_indices_found"), len(limits_df))
-            e3.metric(t("metric_indices_above"), int(limits_df["above_1000"].sum()))
-            e4.metric(t("metric_indices_default"), int(limits_df["default_assumed"].sum()))
-            e5.metric(t("metric_errors"), int((limits_df["status"] == "error").sum()) + len(error_rows))
+            e3.metric(t("metric_indices_configured"), int((limits_df["configured_limit_status"] == "configured").sum()))
+            e4.metric(t("metric_indices_above"), int(limits_df["above_1000"].sum()))
+            e5.metric(t("metric_indices_not_configured"), int((limits_df["configured_limit_status"] == "not_configured").sum()))
+            e6.metric(t("metric_errors"), int((limits_df["status"] == "error").sum()) + len(error_rows))
 
             display_df = limits_df.copy()
             display_df.insert(0, "selected", False)
+            preferred_columns = [
+                "selected",
+                "instance",
+                "base_url",
+                "index_name",
+                "configured_limit",
+                "configured_limit_status",
+                "effective_default",
+                "above_1000",
+                "raw_setting_path",
+                "template_limit",
+                "template_name",
+                "status",
+                "checked_at",
+            ]
+            display_df = display_df[[col for col in preferred_columns if col in display_df.columns] + [col for col in display_df.columns if col not in preferred_columns]]
             edited_df = st.data_editor(display_df, use_container_width=True, key="field_limit_table", disabled=[c for c in display_df.columns if c != "selected"])
             selected_keys = set()
             if isinstance(edited_df, pd.DataFrame) and "selected" in edited_df.columns:
@@ -2140,7 +2174,7 @@ with tab_field_limit:
             if update_preview:
                 st.markdown("### Update preview")
                 preview_df = pd.DataFrame(update_preview)
-                st.dataframe(preview_df[["instance", "index_name", "current_limit", "new_limit", "default_assumed", "update_required", "template_name", "template_current_limit", "template_new_limit", "action", "status"]], use_container_width=True)
+                st.dataframe(preview_df[["instance", "index_name", "configured_limit", "effective_default", "new_limit", "update_required", "reason", "action", "status"]], use_container_width=True)
                 affected_instances = preview_df[preview_df["update_required"] == True]["instance"].nunique()
                 affected_indices = int((preview_df["update_required"] == True).sum())
                 st.warning(

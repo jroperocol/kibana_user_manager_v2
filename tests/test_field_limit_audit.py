@@ -31,24 +31,27 @@ def test_app_import_contract_names_exist():
 
 def test_parse_flat_total_fields_limit():
     result = parse_total_fields_limit({"idx": {"settings": {"index.mapping.total_fields.limit": "1000"}}}, "idx")
-    assert result["total_fields_limit"] == 1000
-    assert result["default_assumed"] is False
-    assert result["status"] == "ok"
+    assert result["configured_limit"] == "1000"
+    assert result["configured_limit_status"] == "configured"
+    assert result["effective_default"] is None
+    assert result["status"] == "configured_1000_or_less"
 
 
 def test_missing_setting_is_default():
     result = parse_total_fields_limit({"idx": {"settings": {}}}, "idx")
-    assert result["total_fields_limit"] == 1000
-    assert result["default_assumed"] is True
+    assert result["configured_limit"] is None
+    assert result["configured_limit_status"] == "not_configured"
+    assert result["effective_default"] == 1000
     assert result["above_1000"] is False
-    assert result["status"] == "default_assumed"
+    assert result["status"] == "not_configured"
 
 
 def test_above_1000_detected_as_workaround():
     result = parse_total_fields_limit({"settings": {"index": {"mapping": {"total_fields": {"limit": "2000"}}}}})
-    assert result["total_fields_limit"] == 2000
+    assert result["configured_limit"] == "2000"
     assert result["above_1000"] is True
-    assert result["status"] == "above_1000"
+    assert result["raw_setting_path"] == "settings.index.mapping.total_fields.limit"
+    assert result["status"] == "configured_above_1000"
 
 
 def test_non_numeric_is_error():
@@ -59,9 +62,9 @@ def test_non_numeric_is_error():
 
 def test_instance_summary_aggregation():
     rows = [
-        {"index_name": "a", "total_fields_limit": 1000, "default_assumed": True, "above_1000": False, "status": "default_assumed"},
-        {"index_name": "b", "total_fields_limit": 1500, "default_assumed": False, "above_1000": True, "status": "above_1000"},
-        {"index_name": "c", "total_fields_limit": "", "default_assumed": False, "above_1000": False, "status": "error"},
+        {"index_name": "a", "configured_limit": None, "configured_limit_status": "not_configured", "effective_default": 1000, "above_1000": False, "status": "not_configured"},
+        {"index_name": "b", "configured_limit": "1500", "configured_limit_status": "configured", "effective_default": None, "above_1000": True, "status": "configured_above_1000"},
+        {"index_name": "c", "configured_limit": None, "configured_limit_status": "request_error", "effective_default": None, "above_1000": False, "status": "error"},
     ]
     summary = build_instance_summary({"name": "inst", "base_url": "http://x"}, rows)
     assert summary["workaround_detected"] is True
@@ -90,13 +93,16 @@ def test_extract_indices_from_cat():
 
 def test_build_update_preview_default_mode():
     rows = [
-        {"instance": "i", "base_url": "http://x", "index_name": "a", "total_fields_limit": 1000, "default_assumed": True, "status": "default_assumed", "template_name": "t", "template_limit": ""},
-        {"instance": "i", "base_url": "http://x", "index_name": "b", "total_fields_limit": 3000, "default_assumed": False, "status": "above_1000", "template_name": "", "template_limit": ""},
+        {"instance": "i", "base_url": "http://x", "index_name": "a", "configured_limit": None, "configured_limit_status": "not_configured", "effective_default": 1000, "status": "not_configured", "template_name": "t", "template_limit": ""},
+        {"instance": "i", "base_url": "http://x", "index_name": "b", "configured_limit": "3000", "configured_limit_status": "configured", "effective_default": None, "status": "configured_above_1000", "template_name": "", "template_limit": ""},
     ]
     preview = build_update_preview(rows, ["i"], set(), "default", 2000, True, True)
     assert len(preview) == 1
     assert preview[0]["index_name"] == "a"
     assert preview[0]["action"] == "dry_run"
+    assert preview[0]["configured_limit"] is None
+    assert preview[0]["effective_default"] == 1000
+    assert preview[0]["reason"] == "not_configured_effective_default_1000"
     assert preview[0]["update_required"] is True
     assert preview[0]["template_new_limit"] == 2000
 
