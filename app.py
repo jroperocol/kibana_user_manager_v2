@@ -175,6 +175,7 @@ I18N = {
     "field_limit_templates": {"ES": "Revisar index templates si están disponibles", "EN": "Inspect index templates when available", "PT": "Revisar index templates se disponíveis"},
     "field_limit_run": {"ES": "Ejecutar auditoría de límite de campos", "EN": "Run field limit audit", "PT": "Executar auditoria de limite de campos"},
     "field_limit_export": {"ES": "Exportar reporte Excel", "EN": "Export Excel report", "PT": "Exportar relatório Excel"},
+    "field_limit_ivrs_note": {"ES": "Se revisarán solo índices que contengan ivrs.", "EN": "Only indices containing ivrs will be checked.", "PT": "Só índices que contenham ivrs serão verificados."},
     "metric_instances_checked": {"ES": "Instancias revisadas", "EN": "Instances checked", "PT": "Instâncias verificadas"},
     "metric_workaround": {"ES": "Con workaround", "EN": "With workaround", "PT": "Com workaround"},
     "metric_default": {"ES": "Solo default/missing", "EN": "Default/missing only", "PT": "Só default/ausente"},
@@ -185,6 +186,7 @@ I18N = {
     "metric_indices_not_configured": {"ES": "Índices sin límite configurado", "EN": "Indices without configured limit", "PT": "Índices sem limite configurado"},
     "metric_instances_configured": {"ES": "Instancias con límite configurado", "EN": "Instances with configured limit", "PT": "Instâncias com limite configurado"},
     "metric_instances_default": {"ES": "Instancias en default 1000", "EN": "Instances using default 1000", "PT": "Instâncias em default 1000"},
+    "metric_instances_with_ivrs": {"ES": "Instancias con IVRS", "EN": "Instances with IVRS", "PT": "Instâncias com IVRS"},
     "metric_highest_limit": {"ES": "Límite máximo detectado", "EN": "Highest limit detected", "PT": "Maior limite detectado"},
     "field_limit_technical_details": {"ES": "Detalles técnicos", "EN": "Technical details", "PT": "Detalhes técnicos"},
     "field_limit_technical_update_details": {"ES": "Detalle técnico del cambio", "EN": "Technical update details", "PT": "Detalhe técnico da alteração"},
@@ -212,6 +214,8 @@ I18N = {
         "PT": "Nota: se o campo não aparecer em GET /<index_name>/_settings, ele será mostrado como não configurado. O Elasticsearch usa 1000 como default efetivo, mas esse valor não fica salvo explicitamente no índice.",
     },
 }
+
+IVRS_INDEX_PATTERN = "*ivrs*"
 
 
 def t(key: str, **kwargs: object) -> str:
@@ -587,6 +591,17 @@ def format_field_limit_http_status(response: Dict[str, Any]) -> str:
     return "error"
 
 
+def contains_ivrs(value: object) -> bool:
+    return "ivrs" in str(value or "").lower()
+
+
+def template_matches_ivrs(template: Dict[str, Any]) -> bool:
+    patterns = template.get("index_patterns") or template.get("patterns") or []
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    return any(contains_ivrs(pattern) for pattern in patterns)
+
+
 def fetch_field_limit_templates(instance: Dict[str, str], headers: Dict[str, str], logs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Best-effort template lookup for the Field Limits audit.
 
@@ -598,6 +613,8 @@ def fetch_field_limit_templates(instance: Dict[str, str], headers: Dict[str, str
     add_field_limit_log(logs, instance["name"], "fetch_templates", resp.get("endpoint", "/_index_template"), resp.get("status_code"), short_message(resp))
     if resp.get("ok"):
         for template in extract_templates(resp.get("data", {})):
+            if not template_matches_ivrs(template):
+                continue
             normalized.append(
                 {
                     **template,
@@ -613,6 +630,8 @@ def fetch_field_limit_templates(instance: Dict[str, str], headers: Dict[str, str
     add_field_limit_log(logs, instance["name"], "fetch_legacy_templates", legacy.get("endpoint", "/_template"), legacy.get("status_code"), short_message(legacy))
     if legacy.get("ok"):
         for template in extract_templates(legacy.get("data", {}), legacy=True):
+            if not template_matches_ivrs(template):
+                continue
             normalized.append(
                 {
                     **template,
@@ -647,21 +666,24 @@ def list_field_limit_indices(instance: Dict[str, str], headers: Dict[str, str], 
 
 def fetch_bulk_field_limits(instance: Dict[str, str], headers: Dict[str, str], include_hidden: bool, logs: List[Dict[str, Any]]) -> tuple[Dict[str, Dict[str, Any]], bool, str]:
     expand = "all" if include_hidden else "open"
+    endpoint = f"/{encoded_path(IVRS_INDEX_PATTERN)}/_settings"
+    params = {"flat_settings": "false", "expand_wildcards": expand, "allow_no_indices": "true", "ignore_unavailable": "true"}
     resp = readonly_get(
         instance["base_url"],
-        "/_settings",
+        endpoint,
         headers,
-        params={"flat_settings": "false", "expand_wildcards": expand},
+        params=params,
     )
-    add_field_limit_log(logs, instance["name"], "get_bulk_settings", resp.get("endpoint", "/_settings"), resp.get("status_code"), short_message(resp))
+    add_field_limit_log(logs, instance["name"], "get_ivrs_settings", resp.get("endpoint", endpoint), resp.get("status_code"), short_message(resp))
     if not resp.get("ok"):
+        fallback_params = {"flat_settings": "true", "expand_wildcards": expand, "allow_no_indices": "true", "ignore_unavailable": "true"}
         resp = readonly_get(
             instance["base_url"],
-            "/_settings",
+            endpoint,
             headers,
-            params={"flat_settings": "true", "expand_wildcards": expand},
+            params=fallback_params,
         )
-        add_field_limit_log(logs, instance["name"], "get_bulk_settings_flat", resp.get("endpoint", "/_settings"), resp.get("status_code"), short_message(resp))
+        add_field_limit_log(logs, instance["name"], "get_ivrs_settings_flat", resp.get("endpoint", endpoint), resp.get("status_code"), short_message(resp))
     http_status = format_field_limit_http_status(resp)
     if not resp.get("ok") or not isinstance(resp.get("data"), dict):
         return {}, False, http_status
@@ -850,8 +872,8 @@ EXPECTED_INSTANCE_COLUMNS = [
     "configured_limit",
     "effective_default",
     "detected_source",
+    "ivrs_indices_found",
     "configured_indices_count",
-    "configured_templates_count",
     "status",
     "message",
     "checked_at",
@@ -873,6 +895,15 @@ def _text_or_default(value: Any, default: str) -> str:
     return str(value)
 
 
+def _highest_limit_value(value: Any) -> int | None:
+    if value in (None, "") or pd.isna(value):
+        return None
+    parts = [part.strip() for part in str(value).split(",")]
+    numeric_values = [_numeric_or_none(part) for part in parts]
+    numeric_values = [part for part in numeric_values if part is not None]
+    return max(numeric_values) if numeric_values else None
+
+
 def normalize_instance_limit_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(rows or [])
     if df.empty:
@@ -886,7 +917,7 @@ def normalize_instance_limit_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
                 df[col] = DEFAULT_FIELD_LIMIT
             elif col == "configured_limit":
                 df[col] = None
-            elif col in {"configured_indices_count", "configured_templates_count"}:
+            elif col in {"ivrs_indices_found", "configured_indices_count"}:
                 fallback = "indices_with_configured_limit" if col == "configured_indices_count" else None
                 df[col] = pd.to_numeric(df[fallback], errors="coerce").fillna(0).astype(int) if fallback and fallback in df.columns else 0
             elif col == "status":
@@ -897,8 +928,8 @@ def normalize_instance_limit_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
                 df[col] = ""
 
     df["selected"] = df["selected"].fillna(False).astype(bool)
+    df["ivrs_indices_found"] = pd.to_numeric(df["ivrs_indices_found"], errors="coerce").fillna(0).astype(int)
     df["configured_indices_count"] = pd.to_numeric(df["configured_indices_count"], errors="coerce").fillna(0).astype(int)
-    df["configured_templates_count"] = pd.to_numeric(df["configured_templates_count"], errors="coerce").fillna(0).astype(int)
 
     for idx, row in df.iterrows():
         if str(row.get("status", "")) == "error" or str(row.get("detected_source", "")) == "error":
@@ -910,36 +941,40 @@ def normalize_instance_limit_rows(rows: List[Dict[str, Any]]) -> pd.DataFrame:
             continue
 
         has_index = int(row.get("configured_indices_count", 0)) > 0
-        has_template = int(row.get("configured_templates_count", 0)) > 0
         configured_limit = _numeric_or_none(row.get("configured_limit"))
-        if configured_limit is None and _numeric_or_none(row.get("current_effective_limit")) is not None and (has_index or has_template):
+        if configured_limit is None and _numeric_or_none(row.get("current_effective_limit")) is not None and has_index:
             configured_limit = _numeric_or_none(row.get("current_effective_limit"))
             df.at[idx, "configured_limit"] = configured_limit
 
-        if has_index and has_template:
-            df.at[idx, "detected_source"] = "index_settings_and_template"
-        elif has_index:
+        if has_index:
             df.at[idx, "detected_source"] = "index_settings"
-        elif has_template:
-            df.at[idx, "detected_source"] = "template"
+        elif int(row.get("ivrs_indices_found", 0)) == 0:
+            df.at[idx, "detected_source"] = "default"
+            df.at[idx, "configured_limit"] = None
+            df.at[idx, "effective_default"] = None
+            df.at[idx, "status"] = "no_ivrs_indices_found"
+            df.at[idx, "message"] = _text_or_default(row.get("message"), "No IVRS indices found")
+            continue
         else:
             df.at[idx, "detected_source"] = "default"
+
+        if str(row.get("status", "")) == "mixed_values" and _text_or_default(row.get("configured_limit"), ""):
+            df.at[idx, "configured_limit"] = _text_or_default(row.get("configured_limit"), "")
+            df.at[idx, "effective_default"] = None
+            df.at[idx, "status"] = "mixed_values"
+            df.at[idx, "message"] = _text_or_default(row.get("message"), "Multiple configured limits found in IVRS indices")
+            continue
 
         if configured_limit is None:
             df.at[idx, "configured_limit"] = None
             df.at[idx, "effective_default"] = DEFAULT_FIELD_LIMIT
             df.at[idx, "status"] = "default_1000"
-            df.at[idx, "message"] = _text_or_default(row.get("message"), "No explicit limit found; effective default is 1000")
-        elif str(row.get("status", "")) == "mixed_values":
-            df.at[idx, "configured_limit"] = configured_limit
-            df.at[idx, "effective_default"] = None
-            df.at[idx, "status"] = "mixed_values"
-            df.at[idx, "message"] = _text_or_default(row.get("message"), "Multiple configured values found")
+            df.at[idx, "message"] = _text_or_default(row.get("message"), "No explicit limit found in IVRS indices; effective default is 1000")
         else:
             df.at[idx, "configured_limit"] = configured_limit
             df.at[idx, "effective_default"] = None
             df.at[idx, "status"] = "configured"
-            df.at[idx, "message"] = _text_or_default(row.get("message"), "Configured limit found")
+            df.at[idx, "message"] = _text_or_default(row.get("message"), "Configured limit found in IVRS indices")
 
     result = df[EXPECTED_INSTANCE_COLUMNS].astype(object)
     return result.where(pd.notna(result), None)
@@ -955,8 +990,8 @@ def build_instance_limit_row(instance: Dict[str, str], index_rows: List[Dict[str
             "configured_limit": None,
             "effective_default": None,
             "detected_source": "error",
+            "ivrs_indices_found": 0,
             "configured_indices_count": 0,
-            "configured_templates_count": 0,
             "status": "error",
             "message": fatal_error or "Request failed",
             "checked_at": checked_at,
@@ -972,6 +1007,7 @@ def build_instance_limit_row(instance: Dict[str, str], index_rows: List[Dict[str
         for row in template_rows
         if str(row.get("template_limit") if row.get("template_limit") is not None else row.get("limit", "")).isdigit()
     ]
+    ivrs_indices_found = len(index_rows)
     all_limits = index_limits + template_limits
     unique_limits = sorted(set(all_limits))
     has_index = bool(index_limits)
@@ -985,21 +1021,27 @@ def build_instance_limit_row(instance: Dict[str, str], index_rows: List[Dict[str
     else:
         detected_source = "default"
 
-    if not all_limits:
+    if ivrs_indices_found == 0:
+        status = "no_ivrs_indices_found"
+        configured_limit = None
+        effective_default = None
+        message = "No IVRS indices found"
+        detected_source = "default"
+    elif not all_limits:
         status = "default_1000"
         configured_limit = None
         effective_default = DEFAULT_FIELD_LIMIT
-        message = "No explicit limit found; effective default is 1000"
+        message = "No explicit limit found in IVRS indices; effective default is 1000"
     elif len(unique_limits) > 1:
         status = "mixed_values"
-        configured_limit = max(unique_limits)
+        configured_limit = ", ".join(str(value) for value in unique_limits)
         effective_default = None
-        message = "Multiple configured values found"
+        message = "Multiple configured limits found in IVRS indices"
     else:
         status = "configured"
         configured_limit = unique_limits[0]
         effective_default = None
-        message = "Configured limit found"
+        message = "Configured limit found in IVRS indices"
 
     return {
         "selected": False,
@@ -1009,8 +1051,8 @@ def build_instance_limit_row(instance: Dict[str, str], index_rows: List[Dict[str
         "configured_limit": configured_limit,
         "effective_default": effective_default,
         "detected_source": detected_source,
+        "ivrs_indices_found": ivrs_indices_found,
         "configured_indices_count": len(index_limits),
-        "configured_templates_count": len(template_limits),
         "status": status,
         "message": message,
         "checked_at": checked_at,
@@ -1025,20 +1067,23 @@ def build_instance_update_preview(instance_rows: List[Dict[str, Any]], selected_
             continue
         configured_limit = row.get("configured_limit")
         effective_default = row.get("effective_default")
-        current_value = _numeric_or_none(configured_limit)
+        current_value = _highest_limit_value(configured_limit)
         if current_value is None:
             current_value = _numeric_or_none(effective_default)
-        update_required = current_value is not None and current_value < int(new_limit) and row.get("status") != "error"
+        update_required = current_value is not None and current_value < int(new_limit) and row.get("status") not in {"error", "no_ivrs_indices_found"}
         if row.get("status") == "error":
             message = row.get("message") or "Request failed"
+        elif row.get("status") == "no_ivrs_indices_found":
+            message = "No IVRS indices found"
         elif update_required:
-            message = "Update will explicitly configure the new limit"
+            message = "Update will explicitly configure the new limit on IVRS indices"
         else:
             message = "Already at or above the new limit"
         preview.append(
             {
                 "instance": row.get("instance", ""),
                 "base_url": row.get("base_url", ""),
+                "ivrs_indices_found": row.get("ivrs_indices_found", 0),
                 "current_configured_limit": configured_limit,
                 "effective_default": effective_default,
                 "new_limit": int(new_limit),
@@ -2201,6 +2246,7 @@ with tab_index:
 with tab_field_limit:
     st.subheader(t("tab_field_limit"))
     st.write(t("field_limit_description"))
+    st.caption(t("field_limit_ivrs_note"))
     st.caption(t("field_limit_missing_note"))
     authenticated_instances = st.session_state.get("authenticated_instances", [])
     headers = get_effective_auth_headers()
@@ -2240,18 +2286,15 @@ with tab_field_limit:
                 status_box = st.empty()
                 total = len(selected_instances)
                 for idx, instance in enumerate(selected_instances, start=1):
-                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — listing indices")
                     instance_rows: List[Dict[str, Any]] = []
-                    try:
-                        indices = list_field_limit_indices(instance, headers, include_hidden, log_rows)
-                    except Exception as exc:
-                        message = truncate_detail(exc, 500)
-                        error_rows.append({"instance": instance["name"], "operation": "cat_indices", "endpoint": "/_cat/indices", "status": "error", "message": message, "timestamp": now_ts()})
-                        summary_rows.append(build_instance_limit_row(instance, [], [], fatal_error=message, http_status="error"))
+                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — fetching IVRS settings")
+                    bulk_settings, bulk_ok, settings_http_status = fetch_bulk_field_limits(instance, headers, include_hidden, log_rows)
+                    if not bulk_ok:
+                        message = f"Request failed ({settings_http_status})"
+                        error_rows.append({"instance": instance["name"], "operation": "ivrs_settings", "endpoint": f"/{IVRS_INDEX_PATTERN}/_settings", "status": "error", "message": message, "timestamp": now_ts()})
+                        summary_rows.append(build_instance_limit_row(instance, [], [], fatal_error=message, http_status=settings_http_status))
                         progress.progress(idx / total)
                         continue
-                    status_box.caption(f"Checking {idx}/{total}: {instance['name']} — fetching settings")
-                    bulk_settings, bulk_ok, settings_http_status = fetch_bulk_field_limits(instance, headers, include_hidden, log_rows)
                     templates = []
                     if inspect_templates:
                         status_box.caption(f"Checking {idx}/{total}: {instance['name']} — checking templates")
@@ -2270,11 +2313,9 @@ with tab_field_limit:
                     for template in templates:
                         template_details.append({"instance": instance["name"], "base_url": instance["base_url"], **template})
                     status_box.caption(f"Checking {idx}/{total}: {instance['name']} — building rows")
+                    indices = sorted(index_name for index_name in bulk_settings if contains_ivrs(index_name))
                     for index_name in indices:
-                        if bulk_ok:
-                            parsed = bulk_settings.get(index_name) or parse_total_fields_limit({index_name: {"settings": {}}}, index_name)
-                        else:
-                            parsed = fetch_index_field_limit_direct(instance, headers, index_name, log_rows)
+                        parsed = bulk_settings.get(index_name) or parse_total_fields_limit({index_name: {"settings": {}}}, index_name)
                         template_name, template_limit = match_template(templates, "", index_name) if templates else ("", "")
                         row = {
                             "instance": instance["name"],
@@ -2285,6 +2326,7 @@ with tab_field_limit:
                             "effective_default": parsed.get("effective_default"),
                             "above_1000": parsed.get("above_1000", False),
                             "raw_setting_path": parsed.get("raw_setting_path", ""),
+                            "http_status": settings_http_status,
                             "template_limit": template_limit,
                             "template_name": template_name,
                             "status": parsed.get("status", ""),
@@ -2323,11 +2365,12 @@ with tab_field_limit:
         if summary_rows:
             instance_df = normalize_instance_limit_rows(summary_rows)
             technical_df = pd.DataFrame(field_limit_rows)
-            e1, e2, e3, e4 = st.columns(4)
+            e1, e2, e3, e4, e5 = st.columns(5)
             e1.metric(t("metric_instances_checked"), len(instance_df))
-            e2.metric(t("metric_instances_configured"), int(instance_df["configured_limit"].notna().sum()))
-            e3.metric(t("metric_instances_default"), int((instance_df["detected_source"] == "default").sum()))
-            e4.metric(t("metric_errors"), int((instance_df["status"] == "error").sum()) + len(error_rows))
+            e2.metric(t("metric_instances_with_ivrs"), int((instance_df["ivrs_indices_found"] > 0).sum()))
+            e3.metric(t("metric_instances_configured"), int(instance_df["configured_limit"].notna().sum()))
+            e4.metric(t("metric_instances_default"), int((instance_df["status"] == "default_1000").sum()))
+            e5.metric(t("metric_errors"), int((instance_df["status"] == "error").sum()) + len(error_rows))
 
             display_df = instance_df.copy()
             main_columns = [
@@ -2335,11 +2378,10 @@ with tab_field_limit:
                 "instance",
                 "base_url",
                 "http_status",
+                "ivrs_indices_found",
                 "configured_limit",
                 "effective_default",
-                "detected_source",
                 "configured_indices_count",
-                "configured_templates_count",
                 "status",
                 "message",
                 "checked_at",
@@ -2370,15 +2412,25 @@ with tab_field_limit:
 
                 if st.button(t("field_limit_prepare"), key="field_limit_prepare_update"):
                     instance_preview = build_instance_update_preview(normalized_summary_rows, selected_instance_names, int(new_limit), bool(dry_run))
-                    technical_preview = build_update_preview(
-                        field_limit_rows,
-                        selected_instance_names,
-                        set(),
-                        "lower",
-                        int(new_limit),
-                        bool(update_template_flag),
-                        bool(dry_run),
-                    )
+                    technical_preview = [
+                        {
+                            "instance": row.get("instance", ""),
+                            "base_url": row.get("base_url", ""),
+                            "index_name": IVRS_INDEX_PATTERN,
+                            "configured_limit": row.get("current_configured_limit"),
+                            "effective_default": row.get("effective_default"),
+                            "new_limit": int(new_limit),
+                            "update_required": bool(row.get("update_required")),
+                            "reason": row.get("message", ""),
+                            "template_name": "",
+                            "template_current_limit": "",
+                            "template_new_limit": "",
+                            "action": "dry_run" if dry_run else "update",
+                            "status": row.get("status", ""),
+                        }
+                        for row in instance_preview
+                        if row.get("update_required")
+                    ]
                     st.session_state.field_limit_update_preview = instance_preview
                     st.session_state.field_limit_update_detail_preview = technical_preview
                     st.session_state.field_limit_update_results = apply_field_limit_updates(technical_preview, headers) if dry_run else []
@@ -2391,11 +2443,11 @@ with tab_field_limit:
             if update_preview:
                 st.markdown("### Update preview")
                 preview_df = pd.DataFrame(update_preview)
-                preview_columns = ["instance", "current_configured_limit", "effective_default", "new_limit", "update_required", "dry_run", "status", "message"]
+                preview_columns = ["instance", "ivrs_indices_found", "current_configured_limit", "effective_default", "new_limit", "update_required", "dry_run", "status", "message"]
                 for col in preview_columns:
                     if col not in preview_df.columns:
                         preview_df[col] = "" if col not in {"update_required", "dry_run"} else False
-                st.dataframe(preview_df[["instance", "current_configured_limit", "effective_default", "new_limit", "update_required", "dry_run", "status", "message"]], use_container_width=True)
+                st.dataframe(preview_df[["instance", "ivrs_indices_found", "current_configured_limit", "effective_default", "new_limit", "update_required", "dry_run", "status", "message"]], use_container_width=True)
                 affected_instances = int((preview_df["update_required"] == True).sum())
                 st.warning(
                     f"{t('field_limit_confirm_text')}\n\n"
@@ -2419,7 +2471,8 @@ with tab_field_limit:
             with st.expander(t("field_limit_technical_details"), expanded=False):
                 if field_limit_rows:
                     st.markdown("#### Index details")
-                    st.dataframe(technical_df, use_container_width=True)
+                    technical_columns = ["instance", "index_name", "configured_limit", "raw_setting_path", "http_status", "checked_at"]
+                    st.dataframe(technical_df[[col for col in technical_columns if col in technical_df.columns]], use_container_width=True)
                 if template_details:
                     st.markdown("#### Template details")
                     st.dataframe(pd.DataFrame(template_details), use_container_width=True)
